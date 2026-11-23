@@ -1,0 +1,169 @@
+<%+header%>
+<%
+local uci  = require "luci.model.uci".cursor()
+local fs   = require "nixio.fs"
+local util = require "luci.util"
+local pcdata = util.pcdata
+
+local log_file = uci:get("captiveportal", "main", "log_file") or "/data/portal/accept.log"
+
+-- Vendor table (same source as the Captive Portal page)
+local oui = {}
+local oui_f = io.open("/data/oui/oui.tsv", "r")
+if oui_f then
+	for line in oui_f:lines() do
+		local p, v = line:match("^(%x+)\t(.+)$")
+		if p then oui[p] = v end
+	end
+	oui_f:close()
+end
+local function vendor(mac)
+	local s = (mac or ""):lower():gsub(":", "")
+	return oui[s:sub(1,10)] or oui[s:sub(1,9)] or oui[s:sub(1,7)] or oui[s:sub(1,6)] or "—"
+end
+
+local function split_fields(line)
+	local f = {}
+	for v in (line .. "|"):gmatch("([^|]*)|") do
+		f[#f + 1] = (v:gsub("^%s+", ""):gsub("%s+$", ""))
+	end
+	return f
+end
+
+local function tail_lines(path, n, guest_only)
+	local out = {}
+	if not fs.access(path) then return out end
+	local f = io.open(path, "r")
+	if not f then return out end
+	local lines = {}
+	for line in f:lines() do if line ~= "" then lines[#lines + 1] = line end end
+	f:close()
+	for i = math.max(1, #lines - n + 1), #lines do
+		local f = split_fields(lines[i])
+		local entry
+		if #f >= 6 then
+			entry = {
+				ts = f[1], ip = f[2], mac = f[3], cc = f[4], target = f[5],
+				ua = f[6],
+				vendor = (f[7] and f[7] ~= "") and f[7] or vendor(f[3])
+			}
+		elseif #f >= 5 then
+			entry = {
+				ts = f[1], ip = f[2], mac = f[3], cc = "-", target = f[4],
+				ua = f[5], vendor = vendor(f[3])
+			}
+		end
+		if entry and (not guest_only or (entry.ip or ""):match("^192%.168%.5%.")) then
+			out[#out + 1] = entry
+		end
+	end
+	return out
+end
+
+local accepts = tail_lines(log_file, 200, true)
+local requests = tail_lines("/tmp/portal-access.log", 40, true)
+
+local unique = {}
+local last = "-"
+for _, a in ipairs(accepts) do
+	if a.mac and a.mac ~= "" then unique[a.mac:lower()] = true end
+	if a.ts and a.ts ~= "" then last = a.ts end
+end
+local unique_n = 0
+for _ in pairs(unique) do unique_n = unique_n + 1 end
+%>
+
+<style type="text/css">
+.gw-mono { font-family:monospace; }
+.gw-toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:14px 0; }
+.gw-toolbar .gw-spacer { margin-left:auto; }
+.gw-stats { display:flex; gap:12px; flex-wrap:wrap; margin:14px 0; }
+.gw-stat { min-width:150px; padding:12px 14px; background:#fff; border:1px solid #e2e6de; border-radius:10px; }
+.gw-stat b { display:block; font-size:20px; line-height:1.2; }
+.gw-stat span { display:block; margin-top:2px; color:#66736d; font-size:11.5px; }
+.gw-page { max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.gw-note { color:#66736d; font-size:12px; }
+</style>
+
+<h2 name="content"><%:Guest Wi-Fi logs%></h2>
+<p class="cbi-map-descr"><%:Captive portal acceptances from the guest subnet (192.168.5.0/24), newest first. Each entry records the client IP, MAC address, vendor, country and the page the guest was trying to open. Old entries without a vendor field are matched against the local OUI table.%></p>
+
+<div class="gw-stats">
+	<div class="gw-stat"><b><%=#accepts%></b><span><%:recent acceptances%></span></div>
+	<div class="gw-stat"><b><%=unique_n%></b><span><%:unique devices%></span></div>
+	<div class="gw-stat"><b class="gw-mono"><%=pcdata(last)%></b><span><%:last acceptance%></span></div>
+</div>
+
+<div class="gw-toolbar">
+	<span class="gw-note"><%=pcdata(log_file)%></span>
+	<span class="gw-spacer"></span>
+	<a class="cbi-button" href="<%=url('admin/mtk/guestwireless/log')%>"><%:Download raw log%></a>
+	<a class="cbi-button" href="<%=url('admin/mtk/guestwireless/logs')%>"><%:Refresh%></a>
+</div>
+
+<div class="cbi-section">
+	<h3><%:Acceptances%></h3>
+	<div class="cbi-section-node">
+	<% if #accepts == 0 then %>
+		<p><em><%:No one has accepted the terms yet.%></em></p>
+	<% else %>
+		<div style="overflow-x:auto">
+		<table class="cbi-section-table">
+			<thead>
+			<tr>
+				<th><%:Time%></th>
+				<th><%:IP address%></th>
+				<th><%:MAC address%></th>
+				<th><%:Vendor%></th>
+				<th><%:Country%></th>
+				<th><%:Requested page%></th>
+			</tr>
+			</thead>
+			<tbody>
+			<% for i = #accepts, 1, -1 do local a = accepts[i] %>
+				<tr title="<%=pcdata(a.ua or "")%>">
+					<td class="gw-mono"><%=pcdata(a.ts)%></td>
+					<td class="gw-mono"><%=pcdata(a.ip or "")%></td>
+					<td class="gw-mono"><%=pcdata(a.mac or "—")%></td>
+					<td><%=pcdata(a.vendor or "—")%></td>
+					<td class="gw-mono"><%=pcdata(a.cc or "—")%></td>
+					<td class="gw-mono gw-page"><%=pcdata(a.target or "—")%></td>
+				</tr>
+			<% end %>
+			</tbody>
+		</table>
+		</div>
+	<% end %>
+	</div>
+</div>
+
+<details class="cbi-section" style="margin-top:16px">
+	<summary><%:Recent splash requests%> <span class="gw-note">(<%=#requests%>)</span></summary>
+	<div class="cbi-section-node" style="margin-top:12px">
+	<% if #requests == 0 then %>
+		<p><em><%:No splash requests recorded yet.%></em></p>
+	<% else %>
+		<div style="overflow-x:auto">
+		<table class="cbi-section-table">
+			<thead><tr><th><%:Time%></th><th><%:IP address%></th><th><%:MAC address%></th><th><%:Vendor%></th><th><%:Country%></th><th><%:Mode%></th></tr></thead>
+			<tbody>
+			<% for i = #requests, 1, -1 do local r = requests[i] %>
+				<tr>
+					<td class="gw-mono"><%=pcdata(r.ts)%></td>
+					<td class="gw-mono"><%=pcdata(r.ip or "")%></td>
+					<td class="gw-mono"><%=pcdata(r.mac or "—")%></td>
+					<td><%=pcdata(vendor(r.mac))%></td>
+					<td class="gw-mono"><%=pcdata(r.cc or "—")%></td>
+					<td class="gw-mono"><%=pcdata(r.target or "—")%></td>
+				</tr>
+			<% end %>
+			</tbody>
+		</table>
+		</div>
+	<% end %>
+	</div>
+</details>
+
+<p class="cbi-map-descr"><%:Vendor data comes from%> <code>/data/oui/oui.tsv</code><%:. A dash means the MAC is locally administered, randomised, or not present in the local OUI table.%></p>
+
+<%+footer%>

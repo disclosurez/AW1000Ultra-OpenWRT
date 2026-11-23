@@ -1,0 +1,175 @@
+#!/bin/sh
+# AW1000 LED controller: drives the router LEDs from the ACTUAL uplink state.
+#
+#   aw1000-led apply      read the state once and set the LEDs
+#   aw1000-led daemon     loop forever (run by the procd service)
+#   aw1000-led status     print the current LED state
+#   aw1000-led takeover   park the vendor led_ctrld (lights_enabled=0)
+#   aw1000-led release    hand the LEDs back to the vendor daemon
+#
+# Why this exists: the vendor led_ctrld drives the LEDs from the MODEM state
+# (MIPC). With the ISP/SIM failover setup the SIM is parked while the wired
+# uplink carries the traffic, so the vendor daemon shows the wrong internet
+# state — and it rewrites the sysfs triggers every few seconds, so the stock
+# System → LED Configuration page (netdev triggers) can never take effect
+# either (this kernel has no netdev trigger at all).
+#
+# LED mapping (kernel 'timer' trigger is used for blinking):
+#   internet:single  ON when the uplink is online, blinking when offline
+#   status:green     always ON (power/system OK)
+#   status:red       ON when the uplink is offline
+#   wifi:green       ON when at least one radio (ra0/rai0) is up
+#   signal:green     ON while the SIM is the active uplink
+#
+# State source: /tmp/wanfailover.status (the failover watchdog probes the real
+# uplink every 10 s). leds.settings.test_state can force a state for testing.
+
+CONF=leds
+
+LED_SYS=/sys/class/leds
+LED_INTERNET="internet:single"
+LED_STATUS_G="status:green"
+LED_STATUS_R="status:red"
+LED_WIFI_G="wifi:green"
+LED_SIGNAL_G="signal:green"
+
+cfg() { uci -q get "$CONF.settings.$1" 2>/dev/null; }
+
+led_set() { # led_set <led> <on|off|blink> [delay_ms]
+	local path="$LED_SYS/$1" mode="$2" d="${3:-400}"
+	[ -d "$path" ] || return 0
+	case "$mode" in
+		on)
+			echo none > "$path/trigger" 2>/dev/null
+			echo 255 > "$path/brightness" 2>/dev/null
+			;;
+		off)
+			echo none > "$path/trigger" 2>/dev/null
+			echo 0 > "$path/brightness" 2>/dev/null
+			;;
+		blink)
+			echo timer > "$path/trigger" 2>/dev/null
+			echo "$d" > "$path/delay_on" 2>/dev/null
+			echo "$d" > "$path/delay_off" 2>/dev/null
+			;;
+	esac
+}
+
+# ---------------------------------------------------------------- state
+uplink_online() {
+	case "$(cfg test_state)" in
+		online)  return 0 ;;
+		offline) return 1 ;;
+	esac
+	# The failover watchdog probes the real uplink; trust it when present.
+	if [ -r /tmp/wanfailover.status ]; then
+		grep -q '^wan_online=up$' /tmp/wanfailover.status
+		return $?
+	fi
+	# Fallback: any default route means "probably online".
+	[ -n "$(ip route show default 2>/dev/null)" ]
+}
+
+sim_active() {
+	if [ -r /tmp/wanfailover.status ]; then
+		grep -q '^state=sim$' /tmp/wanfailover.status
+		return $?
+	fi
+	return 1
+}
+
+wifi_up() {
+	ip link show ra0  2>/dev/null | grep -q ',UP'
+	ip link show rai0 2>/dev/null | grep -q ',UP'
+}
+
+apply_rules() {
+	local enabled blink
+	enabled=$(cfg enabled); [ -n "$enabled" ] || enabled=1
+	blink=$(cfg blink_offline); [ -n "$blink" ] || blink=1
+
+	if [ "$enabled" != "1" ]; then
+		# disabled: leave the LEDs dark, do not fight the vendor daemon
+		led_set "$LED_INTERNET" off
+		led_set "$LED_STATUS_G" off
+		led_set "$LED_STATUS_R" off
+		led_set "$LED_WIFI_G" off
+		led_set "$LED_SIGNAL_G" off
+		return 0
+	fi
+
+	if uplink_online; then
+		led_set "$LED_INTERNET" on
+		led_set "$LED_STATUS_R" off
+	else
+		if [ "$blink" = "1" ]; then
+			led_set "$LED_INTERNET" blink 400
+		else
+			led_set "$LED_INTERNET" off
+		fi
+		led_set "$LED_STATUS_R" on
+	fi
+
+	led_set "$LED_STATUS_G" on
+
+	if wifi_up; then
+		led_set "$LED_WIFI_G" on
+	else
+		led_set "$LED_WIFI_G" off
+	fi
+
+	if sim_active; then
+		led_set "$LED_SIGNAL_G" on
+	else
+		led_set "$LED_SIGNAL_G" off
+	fi
+}
+
+daemon_loop() {
+	local interval
+	interval=$(cfg interval); [ -n "$interval" ] || interval=5
+	case "$interval" in *[!0-9]*|"") interval=5 ;; esac
+	[ "$interval" -lt 2 ] && interval=2
+	logger -t aw1000-led "daemon started (interval=${interval}s)"
+	while :; do
+		apply_rules >/dev/null 2>&1
+		sleep "$interval"
+	done
+}
+
+takeover() {
+	# Park the vendor daemon: it forces all LEDs off once and then stops
+	# touching them, so our controller owns the LEDs from here on.
+	uci set led_ctrld.default_setting.lights_enabled='0'
+	uci commit led_ctrld
+	/etc/init.d/led_ctrld.init restart >/dev/null 2>&1
+	logger -t aw1000-led "vendor led_ctrld parked"
+}
+
+release() {
+	uci set led_ctrld.default_setting.lights_enabled='1'
+	uci commit led_ctrld
+	/etc/init.d/led_ctrld.init restart >/dev/null 2>&1
+	logger -t aw1000-led "vendor led_ctrld restored"
+}
+
+status() {
+	local led b t
+	echo "enabled=$(cfg enabled)"
+	echo "online=$(uplink_online && echo yes || echo no)"
+	echo "sim=$(sim_active && echo active || echo parked)"
+	for led in "$LED_INTERNET" "$LED_STATUS_G" "$LED_STATUS_R" "$LED_WIFI_G" "$LED_SIGNAL_G"; do
+		b=$(cat "$LED_SYS/$led/brightness" 2>/dev/null)
+		t=$(cat "$LED_SYS/$led/trigger" 2>/dev/null | cut -d'[' -f2 | cut -d']' -f1)
+		printf '%s\t%s\t%s\n' "$led" "${b:-?}" "${t:-?}"
+	done
+}
+
+case "$1" in
+	apply)   apply_rules ;;
+	daemon)  daemon_loop ;;
+	status)  status ;;
+	takeover) takeover ;;
+	release) release ;;
+	*) echo "usage: $0 apply|daemon|status|takeover|release" >&2; exit 1 ;;
+esac

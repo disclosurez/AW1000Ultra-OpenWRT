@@ -1,0 +1,391 @@
+#!/bin/sh
+# wan-failover — keep the ISP uplink (wired WAN port) preferred and fall back
+# to the 5G SIM when the ISP uplink has no internet.
+#
+# ISP = interface `isp` (dhcp on eth1)      — UCI route metric 1000 (standby)
+# SIM = interface `wan` (mipc on ccmniX)    — UCI route metric 50  (standby)
+#       The modem section must stay named `wan`: atcid / mipc_wan.init /
+#       EasyMesh hardcode `network.wan`, renaming it breaks modem control.
+#
+# While the ISP answers, the SIM is **parked**: `wan` is brought down (the PDP
+# context goes away, the SIM carries no traffic) and the modem link's IPv6
+# default route is dropped, because otherwise clients' IPv6 traffic would still
+# leave through the SIM. Waking it takes ~2 s.
+#
+# Default routes are keyed by prefix+metric in the kernel, so the two paths
+# always use distinct metric slots — ISP 10/60, SIM 20/50. A transition moves
+# the old path to its standby slot first, then promotes the new one, so a
+# `ip route replace` can never clobber the other path.
+#
+# Usage: wan-failover loop      (procd)
+#        wan-failover check     (one probe, apply, print)
+#        wan-failover status    (print /tmp/wanfailover.status)
+
+. /lib/functions.sh
+
+CONF=wanfailover
+STATUS=/tmp/wanfailover.status
+TAG=wanfailover
+MODEM_STATUS=${MODEM_STATUS:-/bin/modem_status}
+
+# metric slots — ISP and SIM must never share one
+ISP_UP=10
+ISP_DOWN=60
+SIM_UP=20
+SIM_DOWN=50
+
+ENABLED=1
+WAN_DEV=eth1
+WAN_IFACE=isp
+MODEM_DEV=ccmni2
+MODEM_IFACE=wan
+INTERVAL=3
+HOSTS="1.1.1.1 8.8.8.8"
+FAIL_TRIES=2
+OK_TRIES=2
+CONNTRACK_FLUSH=1
+SIM_PARK=1
+SIM_WAIT=40
+SIM_PARKED=unknown
+
+load_config() {
+	config_load "$CONF" 2>/dev/null || return 0
+	config_get_bool ENABLED    settings enabled         1
+	config_get      WAN_DEV    settings wan_device      eth1
+	config_get      WAN_IFACE  settings wan_iface       isp
+	config_get      MODEM_DEV  settings modem_device    ccmni2
+	config_get      MODEM_IFACE settings modem_iface    wan
+	config_get      INTERVAL   settings interval        3
+	config_get      HOSTS      settings ping_hosts      "1.1.1.1 8.8.8.8"
+	config_get      FAIL_TRIES settings fail_tries      2
+	config_get      OK_TRIES   settings ok_tries        2
+	config_get_bool CONNTRACK_FLUSH settings conntrack_flush 1
+	config_get_bool SIM_PARK   settings sim_park        1
+	config_get      SIM_WAIT   settings sim_wait        40
+}
+
+# ---------------------------------------------------------------- probes ----
+
+iface_l3dev() {
+	ubus call "network.interface.$1" status 2>/dev/null \
+		| sed -n 's/^[[:space:]]*"l3_device": "\([^"]*\)".*/\1/p' | head -1
+}
+
+iface_is_up() {
+	ubus call "network.interface.$1" status 2>/dev/null | grep -q '"up": true'
+}
+
+# The modem data interface is ccmniX and X changes on every dial
+# (ccmni2, ccmni3, ...), so ask netifd for the current l3_device.
+resolve_devs() {
+	local d
+	d=$(iface_l3dev "$WAN_IFACE")
+	[ -n "$d" ] && WAN_DEV="$d"
+	d=$(iface_l3dev "$MODEM_IFACE")
+	[ -n "$d" ] && MODEM_DEV="$d"
+}
+
+dev_addr() { ip -4 -o addr show dev "$1" 2>/dev/null | awk 'NR==1 { print $4 }'; }
+
+dev_gw() {
+	ip -4 route show default dev "$1" 2>/dev/null \
+		| sed -n 's/^default via \([0-9][0-9.]*\).*/\1/p' | head -1
+}
+
+# Gateway from the kernel, or from netifd when the route was lost: that keeps
+# the watchdog able to rebuild a route it (or netifd) dropped by accident.
+dev_gw_any() { # device iface
+	local gw
+	gw=$(dev_gw "$1")
+	[ -n "$gw" ] || gw=$(ubus call "network.interface.$2" status 2>/dev/null \
+		| sed -n 's/^[[:space:]]*"nexthop": "\([0-9][0-9.]*\)".*/\1/p' | head -1)
+	echo "$gw"
+}
+
+dev_carrier() {
+	[ "$(cat "/sys/class/net/$1/carrier" 2>/dev/null)" = "1" ]
+}
+
+# Real internet check: force the probe out of the interface, so it also fails
+# when the cable is plugged in but the upstream router has no connectivity.
+wan_online() {
+	[ -n "$(dev_addr "$WAN_DEV")" ] || return 1
+	dev_carrier "$WAN_DEV" || return 1
+	local n=0 h
+	for h in $HOSTS; do
+		ping -I "$WAN_DEV" -c 1 -W 1 -q "$h" >/dev/null 2>&1 && n=$((n + 1))
+	done
+	[ "$n" -gt 0 ]
+}
+
+# A band-lock / 5G-mode change switches the modem to CFUN=4 (RF off) before
+# restoring CFUN=1. If that last step is missed (page closed, command failed),
+# the software radio still reads ON but the modem has no RF and never
+# registers. Restore full functionality before waiting for a PDP context.
+modem_cfun() {
+	[ -x "$MODEM_STATUS" ] || return 1
+	/usr/bin/timeout 15 "$MODEM_STATUS" --at_cmd 'AT+CFUN?' 2>/dev/null \
+		| sed -n 's/.*+CFUN: \([0-9][0-9]*\).*/\1/p' | head -1
+}
+
+restore_modem_rf() { # reason
+	local cfun
+	cfun=$(modem_cfun) || return 0
+	[ "$cfun" = 0 ] || [ "$cfun" = 4 ] || return 0
+	logger -t "$TAG" "modem RF disabled (CFUN=$cfun) [$1] — restoring CFUN=1"
+	/usr/bin/timeout 30 "$MODEM_STATUS" --at_cmd 'AT+CFUN=1' >/dev/null 2>&1
+	sleep 2
+}
+
+# ------------------------------------------------------------ SIM standby ----
+
+# The SIM is not just deprioritised while the ISP is healthy: it is parked.
+# The mipc interface goes down (PDP context torn down, no SIM data at all) and
+# the modem link's IPv6 default route/RA is suppressed — otherwise clients'
+# IPv6 traffic would still leave through the SIM.
+
+sim_up_links() { # modem links that are administratively up
+	local d
+	for d in /sys/class/net/ccmni*; do
+		[ $(( $(cat "$d/flags" 2>/dev/null || echo 0) & 1 )) -ne 0 ] && echo "${d##*/}"
+	done
+}
+
+sim_v6_block() {
+	local n
+	for n in $(sim_up_links); do
+		echo 0 > "/proc/sys/net/ipv6/conf/$n/accept_ra" 2>/dev/null
+		ip -6 route del default dev "$n" >/dev/null 2>&1
+	done
+}
+
+sim_v6_restore() {
+	local n
+	for n in $(sim_up_links); do
+		echo 2 > "/proc/sys/net/ipv6/conf/$n/accept_ra" 2>/dev/null
+	done
+}
+
+sim_park() {
+	[ "$SIM_PARK" = 1 ] || { SIM_PARKED=0; return 0; }
+	if iface_is_up "$MODEM_IFACE"; then
+		logger -t "$TAG" "parking SIM ($MODEM_IFACE down) — ISP is carrying traffic"
+		ubus call "network.interface.$MODEM_IFACE" down >/dev/null 2>&1
+		sleep 1
+	fi
+	sim_v6_block
+	SIM_PARKED=1
+}
+
+sim_wake() {
+	local i=0 d
+	restore_modem_rf "SIM wake"
+	d=$(iface_l3dev "$MODEM_IFACE")
+	[ -n "$d" ] && MODEM_DEV="$d"
+	if iface_is_up "$MODEM_IFACE" && [ -n "$(dev_gw "$MODEM_DEV")" ]; then
+		SIM_PARKED=0
+		return 0
+	fi
+	if iface_is_up "$MODEM_IFACE"; then
+		logger -t "$TAG" "SIM is up but has no default route — restarting it"
+		ubus call "network.interface.$MODEM_IFACE" down >/dev/null 2>&1
+		sleep 1
+	else
+		logger -t "$TAG" "waking SIM ($MODEM_IFACE up)"
+	fi
+	ubus call "network.interface.$MODEM_IFACE" up >/dev/null 2>&1
+	while [ "$i" -lt "$SIM_WAIT" ]; do
+		sleep 1
+		i=$((i + 1))
+		d=$(iface_l3dev "$MODEM_IFACE")
+		[ -n "$d" ] && MODEM_DEV="$d"
+		[ -n "$(dev_gw "$MODEM_DEV")" ] && break
+	done
+	sim_v6_restore
+	if [ -n "$(dev_gw "$MODEM_DEV")" ]; then
+		SIM_PARKED=0
+		return 0
+	fi
+	logger -t "$TAG" "SIM did not come up within ${SIM_WAIT}s"
+	return 1
+}
+
+# ---------------------------------------------------------------- routes ----
+
+# Drop every default route on $1 except the one carrying metric $2.
+prune_defaults() {
+	local dev="$1" keep="$2" r m
+	ip -4 route show default dev "$dev" 2>/dev/null | while IFS= read -r r; do
+		m=$(printf '%s\n' "$r" | sed -n 's/.* metric \([0-9][0-9]*\).*/\1/p')
+		[ -n "$m" ] || m=0
+		[ "$m" = "$keep" ] && continue
+		ip route del $r >/dev/null 2>&1
+	done
+}
+
+set_route() { # dev gw metric
+	[ -n "$2" ] || return 1
+	prune_defaults "$1" "$3"
+	ip route replace default via "$2" dev "$1" metric "$3" >/dev/null 2>&1
+}
+
+demote() { # dev direction
+	set_route "$1" "$(dev_gw "$1")" "$2"
+}
+
+isp_policy_add() {
+	local ip gw
+	ip=$(dev_addr "$WAN_DEV"); ip=${ip%/*}
+	gw=$(dev_gw_any "$WAN_DEV" "$WAN_IFACE")
+	[ -n "$ip" ] && [ -n "$gw" ] || return 0
+	ip route replace default via "$gw" dev "$WAN_DEV" table 201 >/dev/null 2>&1
+	ip rule add from "$ip" lookup 201 priority 9000 2>/dev/null
+}
+
+isp_policy_del() {
+	ip rule del priority 9000 2>/dev/null
+	ip route flush table 201 >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------- state -----
+
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+write_status() {
+	{
+		echo "state=$STATE"
+		echo "active=$ACTIVE"
+		echo "updated=$(now)"
+		echo "since=$SINCE"
+		echo "checks=$CHECKS"
+		echo "fails=$FAILS"
+		echo "wan_device=$WAN_DEV"
+		echo "wan_iface=$WAN_IFACE"
+		echo "wan_online=$WAN_ONLINE"
+		echo "wan_ip=$(dev_addr "$WAN_DEV")"
+		echo "wan_gw=$(dev_gw "$WAN_DEV")"
+		echo "modem_device=$MODEM_DEV"
+		echo "modem_iface=$MODEM_IFACE"
+		echo "modem_ip=$(dev_addr "$MODEM_DEV")"
+		echo "modem_gw=$(dev_gw "$MODEM_DEV")"
+		echo "sim_parked=$SIM_PARKED"
+	} > "$STATUS"
+}
+
+prefer_isp() { # reason
+	local igw note
+	igw=$(dev_gw_any "$WAN_DEV" "$WAN_IFACE")
+	[ -n "$igw" ] || { logger -t "$TAG" "no ISP gateway yet — staying on SIM"; return 1; }
+	# move the SIM into its standby slot first (never share a metric slot)
+	demote "$MODEM_DEV" "$SIM_DOWN"
+	set_route "$WAN_DEV" "$igw" "$ISP_UP"
+	isp_policy_del
+	if [ "$SIM_PARK" = 1 ]; then
+		sim_park
+		note="SIM parked"
+	else
+		note="SIM standby"
+	fi
+	[ "$CONNTRACK_FLUSH" = 1 ] && conntrack -D -i "$MODEM_DEV" >/dev/null 2>&1
+	ACTIVE=isp
+	logger -t "$TAG" "default route -> ISP $WAN_DEV (${igw}) [$1]; $note"
+	return 0
+}
+
+prefer_sim() { # reason
+	local mgw
+	# demote the ISP before the SIM takes the top slot
+	demote "$WAN_DEV" "$ISP_DOWN"
+	[ -n "$(dev_gw "$MODEM_DEV")" ] || sim_wake || return 1
+	mgw=$(dev_gw "$MODEM_DEV")
+	[ -n "$mgw" ] || return 1
+	set_route "$MODEM_DEV" "$mgw" "$SIM_UP"
+	# keep the ISP's own traffic (dhcp renew, probes) on the wire while the
+	# SIM owns the default route
+	isp_policy_add
+	[ "$CONNTRACK_FLUSH" = 1 ] && conntrack -D -i "$WAN_DEV" >/dev/null 2>&1
+	ACTIVE=sim
+	logger -t "$TAG" "default route -> SIM $MODEM_DEV (${mgw}) [$1]; ISP standby"
+	return 0
+}
+
+# ---------------------------------------------------------------- modes -----
+
+one_shot() {
+	load_config
+	resolve_devs
+	STATE=init ACTIVE=unknown SINCE=- CHECKS=0 FAILS=0 WAN_ONLINE=unknown SIM_PARKED=unknown
+	if wan_online; then
+		WAN_ONLINE=up
+		prefer_isp "manual check"
+	else
+		WAN_ONLINE=down
+		prefer_sim "manual check"
+	fi
+	write_status
+	cat "$STATUS"
+}
+
+run_loop() {
+	local fails=0 oks=0
+	STATE=init ACTIVE=unknown SINCE=- CHECKS=0 FAILS=0 WAN_ONLINE=unknown SIM_PARKED=unknown
+	logger -t "$TAG" "watchdog started (ISP $WAN_DEV, SIM $MODEM_DEV)"
+	restore_modem_rf "watchdog start"
+	while :; do
+		load_config
+		if [ "$ENABLED" = 0 ]; then
+			sleep "$INTERVAL"
+			continue
+		fi
+		resolve_devs
+
+		CHECKS=$((CHECKS + 1))
+		if wan_online; then
+			WAN_ONLINE=up
+			fails=0
+			oks=$((oks + 1))
+		else
+			WAN_ONLINE=down
+			oks=0
+			fails=$((fails + 1))
+		fi
+		FAILS=$fails
+
+		case "$STATE" in
+		init)
+			if [ "$WAN_ONLINE" = up ]; then
+				prefer_isp "startup probe" && { STATE=isp; SINCE=$(now); }
+			elif [ "$fails" -ge "$FAIL_TRIES" ]; then
+				prefer_sim "startup probe: ISP unreachable" && { STATE=sim; SINCE=$(now); }
+			fi
+			;;
+		isp)
+			if [ "$WAN_ONLINE" = down ] && [ "$fails" -ge "$FAIL_TRIES" ]; then
+				prefer_sim "ISP down ${fails}x" && { STATE=sim; SINCE=$(now); }
+			else
+				# ISP healthy: keep our metric on top and the SIM parked
+				set_route "$WAN_DEV" "$(dev_gw_any "$WAN_DEV" "$WAN_IFACE")" "$ISP_UP"
+				sim_park
+			fi
+			;;
+		sim)
+			if [ "$WAN_ONLINE" = up ] && [ "$oks" -ge "$OK_TRIES" ]; then
+				prefer_isp "ISP recovered ${oks}x" && { STATE=isp; SINCE=$(now); }
+			else
+				set_route "$MODEM_DEV" "$(dev_gw "$MODEM_DEV")" "$SIM_UP"
+				set_route "$WAN_DEV" "$(dev_gw_any "$WAN_DEV" "$WAN_IFACE")" "$ISP_DOWN"
+			fi
+			;;
+		esac
+
+		write_status
+		sleep "$INTERVAL"
+	done
+}
+
+case "$1" in
+loop)   run_loop ;;
+check)  one_shot ;;
+status) cat "$STATUS" 2>/dev/null || echo "no status yet" ;;
+*)      echo "usage: $0 loop|check|status" >&2; exit 1 ;;
+esac

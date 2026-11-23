@@ -1,0 +1,48 @@
+# Package requirements for AW1000Ultra-OpenWRT.
+# Install with:  opkg update && opkg install <list>
+#
+# Names are for the vendor OpenWrt 19.07.7 image on this device. Most are
+# already present; the installer warns rather than installing automatically.
+
+# --- required by the firewall/service layer -------------------------------
+ipset
+conntrack
+ebtables
+ebtables-utils
+iptables
+iptables-mod-conntrack-extra
+iptables-mod-extra
+iptables-mod-filter
+iptables-mod-ipopt
+iptables-mod-iprange
+curl
+gzip
+
+# --- optional: statistics -------------------------------------------------
+collectd
+collectd-mod-cpu
+collectd-mod-interface
+collectd-mod-iwinfo
+collectd-mod-load
+collectd-mod-memory
+collectd-mod-rrdtool
+luci-app-statistics
+
+# --- optional: interface traffic history ---------------------------------
+vnstat
+
+# --- optional: TLS syslog for SIEM forwarding ----------------------------
+# Only needed when target.proto=tls in /etc/config/siem. HTTP(S) delivery
+# already uses curl (required above).
+openssl-util
+
+# --- file shares ---------------------------------------------------------
+# samba4-client provides smbclient for the File Shares page (no kernel
+# modules, nothing mounted). ca-bundle keeps HTTPS verification sane on the
+# router itself.
+ca-bundle
+samba4-client
+
+# --- opencode client -----------------------------------------------------
+# No packages: ocproxy is a static Go binary built with ./build-ocproxy.sh and
+# installed to /data/ocproxy/bin/ocproxy.

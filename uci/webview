@@ -1,0 +1,9 @@
+config settings 'settings'
+	option enabled '1'
+	# Gateway port. The viewer serves its own UI and listens on every router
+	# address (LAN, hostname, WireGuard); the WAN zone drops the port.
+	option port '8090'
+	# Send the viewer's own requests through the NordVPN WireGuard interface
+	# (wgvpn). If the tunnel has no recent handshake the route is withdrawn and
+	# traffic fails open over the WAN.
+	option vpn '1'

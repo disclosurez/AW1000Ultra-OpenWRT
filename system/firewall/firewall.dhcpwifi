@@ -1,0 +1,7 @@
+#!/bin/sh
+for p in eth0 rndis0; do
+	ebtables -t broute -C BROUTING -i "$p" -p IPv4 --ip-proto udp --ip-sport 68 --ip-dport 67 -j DROP 2>/dev/null ||
+	ebtables -t broute -A BROUTING -i "$p" -p IPv4 --ip-proto udp --ip-sport 68 --ip-dport 67 -j DROP
+	ebtables -t broute -C BROUTING -i "$p" -p IPv6 --ip6-proto udp --ip6-sport 546 --ip6-dport 547 -j DROP 2>/dev/null ||
+	ebtables -t broute -A BROUTING -i "$p" -p IPv6 --ip6-proto udp --ip6-sport 546 --ip6-dport 547 -j DROP
+done

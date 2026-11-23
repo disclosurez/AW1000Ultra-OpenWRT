@@ -1,0 +1,9 @@
+#!/bin/sh
+# Clear the dnsmasq query log (runs at 00:00 and 12:00 UTC from cron).
+LOG=/data/logs/dns.log
+
+[ -f "$LOG" ] || exit 0
+
+: > "$LOG"
+rm -f "$LOG".*.gz
+logger -t dnslog "cleared 12-hour DNS query log"

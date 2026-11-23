@@ -1,0 +1,280 @@
+#!/bin/sh
+# Captive portal: record the acceptance, open the local session and show
+# "you're online".
+
+CONF=captiveportal
+
+cfg() {
+	uci -q get "$CONF.main.$1" 2>/dev/null
+}
+
+log_file=$(cfg log_file);   [ -n "$log_file" ] || log_file=/data/portal/accept.log
+minutes=$(cfg session_minutes); [ -n "$minutes" ] || minutes=240
+title=$(cfg title);         [ -n "$title" ] || title="Guest Wi-Fi"
+
+minutes_num=$(printf '%s' "$minutes" | tr -cd '0-9')
+[ -n "$minutes_num" ] || minutes_num=240
+hours=$((minutes_num / 60))
+mins=$((minutes_num % 60))
+if [ "$hours" -gt 0 ]; then
+	if [ "$mins" -gt 0 ]; then
+		session_label="$hours h $mins min"
+	elif [ "$hours" -eq 1 ]; then
+		session_label="1 hour"
+	else
+		session_label="$hours hours"
+	fi
+else
+	if [ "$mins" -eq 1 ]; then session_label="1 minute"; else session_label="$mins minutes"; fi
+fi
+
+urldecode() {
+	printf '%b' "$(printf '%s' "$1" | sed 's/+/ /g; s/%/\\x/g')"
+}
+
+field() {
+	local want="$1" pair
+	for pair in $(printf '%s' "$body" | tr '&' '\n'); do
+		case "$pair" in
+			"$want="*) printf '%s' "${pair#*=}" ;;
+		esac
+	done
+}
+
+esc() {
+	printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'
+}
+
+body=""
+if [ "${REQUEST_METHOD:-GET}" = "POST" ] && [ -n "${CONTENT_LENGTH:-}" ]; then
+	body=$(head -c "$CONTENT_LENGTH" 2>/dev/null)
+fi
+
+# A plain GET means "show the page again", not an acceptance.
+if [ "${REQUEST_METHOD:-GET}" != "POST" ]; then
+	printf 'Status: 302 Found\r\nLocation: ../cgi-bin/splash\r\n\r\n'
+	exit 0
+fi
+
+back=$(urldecode "$(field url)")
+case "$back" in http://*|https://*) ;; *) back="" ;; esac
+back_host=""
+if [ -n "$back" ]; then
+	back_host=$(printf '%s' "$back" | sed -E 's#^https?://([^/]+).*#\1#')
+fi
+[ -n "$back_host" ] || back_host="your original page"
+
+mac=$(urldecode "$(field mac)" | tr -d ' ' | tr -- '-' ':')
+case "$mac" in
+	[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]) ;;
+	*) mac="" ;;
+esac
+
+client_ip=$(urldecode "$(field client_ip)" | tr -d ' ')
+case "$client_ip" in *[!0-9.]*|"") client_ip="" ;; esac
+
+ip="$client_ip"
+[ -n "$ip" ] || ip="${HTTP_CF_CONNECTING_IP:-}"
+[ -n "$ip" ] || ip="${REMOTE_ADDR:-}"
+ua="${HTTP_USER_AGENT:-}"
+country="${HTTP_CF_IPCOUNTRY:-}"
+
+# The guest is on this router's Wi-Fi, so resolve the MAC from ARP.
+if [ -z "$mac" ] && [ -n "$ip" ]; then
+	mac=$(awk -v ip="$ip" '$1 == ip { print tolower($4); exit }' /proc/net/arp 2>/dev/null)
+	case "$mac" in
+		[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+		*) mac="" ;;
+	esac
+fi
+
+# Vendor from the local OUI table (refreshed by /usr/sbin/oui-update).
+oui_file=/data/oui/oui.tsv
+[ -r "$oui_file" ] || oui_file=/etc/oui/oui.tsv
+vendor="-"
+if [ -n "$mac" ] && [ -r "$oui_file" ]; then
+	oui_key=$(printf '%s' "$mac" | tr -d ':' | tr 'A-F' 'a-f')
+	vendor=$(awk -F '\t' -v k="$oui_key" '
+		length($1) > best && index(k, $1) == 1 { best = length($1); v = $2 }
+		END { if (best) print v }
+	' "$oui_file" | tr -d '\r')
+	[ -n "$vendor" ] || vendor="-"
+fi
+
+ts=$(date '+%Y-%m-%d %H:%M:%S')
+mkdir -p "${log_file%/*}" 2>/dev/null
+# keep the accept log small on flash
+if [ -f "$log_file" ] && [ "$(wc -c < "$log_file")" -gt 200000 ]; then
+	mv -f "$log_file" "$log_file.1" 2>/dev/null
+fi
+printf '%s | %s | %s | %s | %s | %s | %s\n' "$ts" "$ip" "${mac:--}" "${country:--}" \
+	"${back:-direct}" "$(printf '%s' "$ua" | tr '|' '/')" \
+	"$(printf '%s' "$vendor" | tr '|' '/')" >> "$log_file"
+logger -t captive-portal "accepted ip=$ip mac=${mac:-unknown} vendor=$vendor target=${back:-none}"
+
+if [ -n "$ip" ]; then
+	# The nat table cannot match a hash:mac set, so keep the leased IP in
+	# portal_ok_ip as well; the MAC entry is what the forward chain uses.
+	if [ -n "$mac" ]; then
+		ipset add portal_ok "$mac" timeout $((minutes_num * 60)) 2>/dev/null
+	fi
+	ipset add portal_ok_ip "$ip" timeout $((minutes_num * 60)) 2>/dev/null
+	conntrack -D -s "$ip" >/dev/null 2>&1
+fi
+
+# --------------------------------------------------------- standalone success
+cat <<EOF
+Content-Type: text/html; charset=utf-8
+
+EOF
+cat <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#0e1412">
+<title>Connected · Guest Wi-Fi</title>
+$( [ -n "$back" ] && printf '<meta http-equiv="refresh" content="5; url=%s">\n' "$(esc "$back")" )
+<style>
+	:root {
+		--ink: #0e1412;
+		--paper: #eef1ec;
+		--card: #ffffff;
+		--jade: #0e7a6e;
+		--jade-2: #0b6b60;
+		--mint: #57d8be;
+		--text: #1f2a25;
+		--muted: #66736d;
+		--line: #e2e6de;
+		--soft: #f7f9f5;
+	}
+	* { box-sizing: border-box; }
+	html { -webkit-text-size-adjust: 100%; }
+	body {
+		margin: 0; min-height: 100vh; background: var(--paper); color: var(--text);
+		font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+		display: flex; flex-direction: column; align-items: center; justify-content: center;
+		padding: clamp(14px, 4vw, 48px); position: relative; overflow-x: hidden;
+	}
+	body::before {
+		content: ""; position: fixed; inset: 0; pointer-events: none;
+		background:
+			radial-gradient(900px 520px at 8% -10%, rgba(87,216,190,.20), transparent 60%),
+			radial-gradient(720px 420px at 100% 0%, rgba(14,122,110,.10), transparent 55%);
+	}
+	.card {
+		position: relative; width: 100%; max-width: 560px; background: var(--card);
+		border: 1px solid var(--line); border-radius: 24px;
+		box-shadow: 0 30px 80px rgba(14,20,18,.12), 0 2px 8px rgba(14,20,18,.04);
+		overflow: hidden;
+	}
+	.head {
+		position: relative; overflow: hidden; background: var(--ink); color: #f4f5f1;
+		padding: 26px 30px; display: flex; align-items: center; gap: 14px;
+	}
+	.head::after {
+		content: ""; position: absolute; right: -100px; top: -120px;
+		width: 280px; height: 280px; border-radius: 50%;
+		background: radial-gradient(circle, rgba(87,216,190,.20), transparent 65%);
+		pointer-events: none;
+	}
+	.check {
+		position: relative; width: 44px; height: 44px; border-radius: 50%; flex: 0 0 auto;
+		background: linear-gradient(140deg, var(--jade), #149a88); color: #eafff9;
+		display: grid; place-items: center; box-shadow: 0 8px 24px rgba(14,122,110,.35);
+	}
+	.check svg { width: 23px; height: 23px; }
+	.eyebrow {
+		position: relative; margin: 0 0 3px; font-size: 11px; font-weight: 700;
+		letter-spacing: .16em; text-transform: uppercase; color: var(--mint);
+	}
+	h1 { position: relative; margin: 0; font-size: 24px; letter-spacing: -.02em; }
+	.body { padding: 26px 30px 28px; }
+	.lead { margin: 0; font-size: 14px; line-height: 1.6; color: #37423c; }
+	.lead strong { color: var(--ink); overflow-wrap: anywhere; }
+	.session {
+		display: flex; gap: 12px; margin-top: 16px; padding: 14px 16px;
+		background: var(--soft); border: 1px solid var(--line); border-radius: 14px;
+		color: #37423c;
+	}
+	.session svg { width: 20px; height: 20px; color: var(--jade); flex: 0 0 auto; margin-top: 1px; }
+	.session b { display: block; font-size: 13.5px; }
+	.session span { display: block; margin-top: 2px; font-size: 12px; color: var(--muted); }
+	.btn {
+		display: flex; align-items: center; justify-content: center; gap: 8px;
+		width: 100%; margin-top: 18px; padding: 13px 16px; border-radius: 12px;
+		background: var(--jade); color: #fff; text-decoration: none;
+		font-weight: 650; font-size: 14px; text-align: center;
+		transition: background .15s ease; overflow-wrap: anywhere;
+	}
+	.btn:hover { background: var(--jade-2); }
+	.btn:focus-visible { outline: 3px solid rgba(87,216,190,.45); outline-offset: 2px; }
+	.btn svg { width: 16px; height: 16px; flex: 0 0 auto; }
+	.small { margin: 10px 0 0; text-align: center; font-size: 11.5px; color: var(--muted); }
+	.note {
+		margin: 18px 0 0; padding-top: 14px; border-top: 1px solid var(--line);
+		font-size: 11.5px; color: #7b8781; line-height: 1.55;
+	}
+	.foot { margin: 14px 0 0; font-size: 11px; color: #7b8781; text-align: center; }
+	@media (max-width: 520px) {
+		body { padding: 12px; justify-content: flex-start; }
+		.card { border-radius: 20px; }
+		.head, .body { padding-left: 22px; padding-right: 22px; }
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.btn { transition: none; }
+	}
+</style>
+</head>
+<body>
+<main class="card">
+	<header class="head">
+		<div class="check" aria-hidden="true">
+			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+				<path d="M4.5 12.5l5 5 10-11"/>
+			</svg>
+		</div>
+		<div>
+			<p class="eyebrow">Guest Wi-Fi</p>
+			<h1>You're online</h1>
+		</div>
+	</header>
+	<section class="body">
+		<p class="lead">Your device is connected to <strong>$(esc "$title")</strong>.</p>
+		<div class="session">
+			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+				<circle cx="12" cy="12" r="8.5"/>
+				<path d="M12 7.5V12l3 2"/>
+			</svg>
+			<div>
+				<b>Session up to $(esc "$session_label")</b>
+				<span>You'll see the portal again when it expires.</span>
+			</div>
+		</div>
+EOF
+
+if [ -n "$back" ]; then
+	cat <<EOF
+		<a class="btn" href="$(esc "$back")">Continue to $(esc "$back_host")
+			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+				<path d="M5 12h13"/><path d="M13 6l6 6-6 6"/>
+			</svg>
+		</a>
+		<p class="small">Taking you there automatically…</p>
+EOF
+else
+	cat <<EOF
+		<p class="small">You can close this tab and start browsing.</p>
+EOF
+fi
+
+cat <<EOF
+		<p class="note">If the network stops working, reconnect to the Wi-Fi and accept the terms again.</p>
+	</section>
+</main>
+<p class="foot">Need help? Contact the network administrator.</p>
+</body>
+</html>
+EOF

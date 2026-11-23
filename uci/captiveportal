@@ -1,0 +1,23 @@
+# Seed for /etc/config/captiveportal — written only if the file does not exist.
+# Splash page: http://<router>:<port>/  (LuCI stays on port 80).
+#
+# Enforcement is scoped to the network interface in gate_iface. Only traffic
+# entering the router on that interface is gated. On this firmware the radios
+# (ra0/rai0) are bridged into br-lan, so br-lan is the interface to select —
+# iptables sees the bridge, not the individual radio.
+#
+# Add the MACs of devices that must never see the portal to 'exempt'.
+
+config portal 'main'
+	option enabled '1'
+	option mode 'local'
+	option gate_iface 'br-lan'
+	option port '8088'
+	option title 'Guest Wi-Fi'
+	option subtitle 'Free guest Wi-Fi'
+	option intro 'Welcome! Please read the terms below and tap Accept to get online.'
+	option session_minutes '240'
+	option redirect_url ''
+	option terms_file '/etc/captiveportal.terms.txt'
+	option log_file '/data/portal/accept.log'
+	option exempt ''

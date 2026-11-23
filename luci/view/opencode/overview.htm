@@ -1,0 +1,283 @@
+<%+header%>
+<%
+local uci = require "luci.model.uci".cursor()
+local fs  = require "nixio.fs"
+local http = require "luci.http"
+local function get(k, d)
+	local v = uci:get("opencode", "settings", k)
+	if v == nil or v == "" then return d end
+	return v
+end
+local enabled   = get("enabled", "1")
+local port      = get("port", "8091")
+local upstream  = get("upstream", "")
+local pair_url  = get("pair_url", "")
+local insecure  = get("insecure", "0")
+local lan       = uci:get("network", "lan", "ipaddr") or "192.168.0.1"
+local installed = fs.access("/data/ocproxy/bin/ocproxy") ~= nil
+local saved     = http.formvalue("saved")
+local failed    = http.formvalue("error")
+local noupstream = http.formvalue("noupstream")
+
+-- Render the working URL up front, so the buttons work even if the page's
+-- script has not run yet. Over HTTPS the TLS gate serves the app on the
+-- console's own origin; over HTTP the proxy port is used directly.
+local scheme = (http.getenv("HTTPS") == "on") and "https" or "http"
+local host = http.getenv("HTTP_HOST") or lan
+host = host:gsub(":%d+$", "")
+local base
+if scheme == "https" then
+	base = "https://" .. host .. "/?oc=1"
+else
+	base = "http://" .. lan .. ":" .. port .. "/"
+end
+local function chk(v) return (v == "1") and "checked" or "" end
+%>
+
+<script type="text/javascript">
+//<![CDATA[
+var ocStatus = '<%=url("admin/tools/opencode/status")%>';
+var ocPair   = '<%=url("admin/tools/opencode/pair")%>';
+var ocToken  = '<%=token%>';
+var ocPort   = '<%=port%>';
+var ocHosts  = (function () {
+	var out = [], h = ['<%=lan%>', window.location.hostname];
+	for (var i = 0; i < h.length; i++) if (h[i] && out.indexOf(h[i]) < 0) out.push(h[i]);
+	return out;
+})();
+var ocIdx = 0, ocRetried = false;
+var ocHttps = window.location.protocol === 'https:';
+var ocBase = '<%=base%>';
+
+function ocBaseFor(h) {
+	return ocHttps ? 'https://' + h + '/?oc=1' : 'http://' + h + ':' + ocPort + '/';
+}
+function ocProbeURL(h) {
+	return ocHttps ? 'https://' + h + '/api/info' : 'http://' + h + ':' + ocPort + '/__status';
+}
+function ocBust(u) { return u + (u.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now(); }
+
+function ocSet(id, v) { var e = document.getElementById(id); if (e) e.textContent = (v === undefined || v === null || v === '') ? '—' : v; }
+
+function ocTabs() {
+	var tabs = document.querySelectorAll('.oc-tab');
+	for (var i = 0; i < tabs.length; i++) {
+		tabs[i].onclick = function () {
+			var name = this.getAttribute('data-panel');
+			for (var j = 0; j < tabs.length; j++) tabs[j].classList.toggle('is-active', tabs[j] === this);
+			var panels = document.querySelectorAll('.oc-panel');
+			for (var k = 0; k < panels.length; k++) {
+				panels[k].hidden = panels[k].id !== 'oc-panel-' + name;
+			}
+			if (name === 'session') ocPoll();
+		};
+	}
+}
+
+function ocRender(d) {
+	if (!d) return;
+	var dot = document.getElementById('oc-dot');
+	if (dot) dot.style.background = (d.running && d.paired) ? '#5cb85c' : (d.enabled ? '#d9534f' : '#8d9993');
+	ocSet('oc-state', (d.running && d.paired) ? 'paired' : (d.running ? 'not paired' : 'service stopped'));
+	ocSet('oc-upstream', d.upstream || '—');
+	ocSet('oc-age', d.paired ? (d.cookie_age + 's ago') : '—');
+	ocSet('oc-url', d.url);
+	ocSet('oc-error', d.error || '');
+}
+
+function ocPoll() {
+	if (!window.fetch) return;
+	fetch(ocStatus, { credentials: 'same-origin', cache: 'no-store' })
+		.then(function (r) { return r.ok ? r.json() : null; })
+		.then(function (d) { if (d) ocRender(d); })
+		.catch(function () {});
+}
+
+function ocPairNow(btn) {
+	var out = document.getElementById('oc-error');
+	if (out) { out.textContent = 'Pairing…'; out.style.color = ''; }
+	btn.disabled = true;
+	fetch(ocPair, { method: 'POST', credentials: 'same-origin',
+		headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+		body: 'token=' + encodeURIComponent(ocToken) })
+		.then(function (r) { return r.json(); })
+		.then(function (d) {
+			btn.disabled = false;
+			if (out) {
+				out.textContent = d.ok ? 'Paired with the server.' : ('Pairing failed: ' + (d.error || 'unknown'));
+				out.style.color = d.ok ? '#147A57' : '#BC3A2E';
+			}
+			ocPoll();
+		}).catch(function () { btn.disabled = false; });
+}
+
+function ocApplyBase() {
+	ocBase = ocBaseFor(ocHosts[ocIdx]);
+	var ids = ['oc-open', 'oc-open2'];
+	for (var i = 0; i < ids.length; i++) {
+		var a = document.getElementById(ids[i]);
+		if (a) a.href = ocBase;
+	}
+	var u = document.getElementById('oc-local');
+	if (u) u.textContent = ocBase;
+}
+
+function ocLoad() {
+	ocApplyBase();
+	var f = document.getElementById('oc-frame');
+	f.setAttribute('src', ocBust(ocBase));
+	var btn = document.getElementById('oc-load');
+	if (btn) btn.style.display = 'none';
+	var hint = document.getElementById('oc-hint');
+	if (hint) hint.hidden = true;
+}
+
+function ocProbe(i) {
+	return fetch(ocProbeURL(ocHosts[i]), { cache: 'no-store', mode: 'no-cors' })
+		.then(function () { return i; });
+}
+
+function ocCheck() {
+	var chain = Promise.reject();
+	ocHosts.forEach(function (_, i) {
+		chain = chain.catch(function () { return ocProbe(i); });
+	});
+	chain.then(function (okIdx) {
+		var h = document.getElementById('oc-hint');
+		if (h) h.hidden = true;
+		if (okIdx !== ocIdx && !ocRetried) {
+			ocRetried = true;
+			ocIdx = okIdx;
+			ocLoad();
+		}
+	}).catch(function () {
+		var h = document.getElementById('oc-hint');
+		if (h) h.hidden = false;
+		var t = document.getElementById('oc-tried');
+		if (t) t.textContent = 'Tried ' + ocHosts.map(function (x) { return ocProbeURL(x); }).join(' and ') + ' from ' + window.location.origin + '.';
+	});
+}
+
+if (document.addEventListener) {
+	document.addEventListener('DOMContentLoaded', function () {
+		ocTabs();
+		ocApplyBase();
+		ocPoll();
+		setInterval(ocPoll, 8000);
+		setTimeout(ocLoad, 250);
+		var f = document.getElementById('oc-frame');
+		if (f) f.addEventListener('load', function () { setTimeout(ocCheck, 600); });
+	});
+}
+//]]>
+</script>
+
+<h2 name="content"><%:OpenCode%></h2>
+<p class="cbi-map-descr">
+	<%:Pair with an existing OpenCode server and use its web UI from this page. The router signs in once (password or a one-time pairing link from `opencode pair` / `opencode pair --remote`), then proxies the UI, API and WebSocket on the LAN — the same session the desktop/mobile app gets.%>
+</p>
+
+<% if saved then %>
+<div class="alert-message success"><div><h4><%:Saved%></h4><p><%:Settings applied; the proxy restarted and paired.%></p></div></div>
+<% end %>
+<% if failed then %>
+<div class="alert-message error"><div><h4><%:Not saved%></h4><p><%:Missing token — reload and try again.%></p></div></div>
+<% end %>
+<% if noupstream then %>
+<div class="alert-message warning"><div><h4><%:No server configured%></h4><p><%:Enter a server URL or a pairing link in the Connection tab.%></p></div></div>
+<% end %>
+<% if not installed then %>
+<div class="alert-message warning"><div><h4><%:Proxy binary missing%></h4>
+	<p><%:Build and deploy it:%> <code>./build-ocproxy.sh</code> → <code>dist/ocproxy-arm64</code>.</p></div></div>
+<% end %>
+
+<div class="oc-tabs" role="tablist">
+	<button type="button" class="oc-tab is-active" data-panel="session" role="tab" aria-selected="true"><%:Session%></button>
+	<button type="button" class="oc-tab" data-panel="status" role="tab"><%:Status%></button>
+	<button type="button" class="oc-tab" data-panel="connection" role="tab"><%:Connection%></button>
+</div>
+
+<section id="oc-panel-session" class="oc-panel">
+	<div class="cbi-section">
+		<div class="oc-toolbar">
+			<h3><%:Session%></h3>
+			<div class="oc-tools">
+				<a class="btn cbi-button cbi-button-apply" id="oc-open" href="<%=pcdata(base)%>" target="_blank" rel="noopener"><%:Open full page%></a>
+				<button class="btn" type="button" onclick="ocLoad()"><%:Reload%></button>
+				<button class="btn" type="button" onclick="ocPairNow(this)"><%:Pair now%></button>
+			</div>
+		</div>
+		<p class="cbi-section-descr"><%:The frame is the live OpenCode app. If it stops updating after a server restart, press Pair now.%></p>
+		<iframe id="oc-frame" title="<%:OpenCode%>" src=""
+			style="width:100%;height:780px;border:1px solid #d7ddd3;border-radius:10px;background:#fff"></iframe>
+		<div id="oc-hint" hidden class="cbi-section-descr" style="margin-top:10px">
+			<strong><%:The frame did not load.%></strong>
+			<span id="oc-tried" style="display:block;margin:2px 0 6px"></span>
+			<ul style="margin:6px 0 0 18px">
+				<li><%:this device must be able to reach the router on the URL above;%></li>
+				<li><%:the OpenCode service must be running — see the Status tab;%></li>
+				<li><%:if you opened the console over HTTPS, the app is served on the same origin and needs no extra trust.%></li>
+			</ul>
+		</div>
+	</div>
+</section>
+
+<section id="oc-panel-status" class="oc-panel" hidden>
+	<div class="cbi-section">
+		<h3><%:Status%></h3>
+		<div class="cbi-section-node">
+			<div class="cbi-value"><label class="cbi-value-title"><%:Pairing%></label>
+				<div class="cbi-value-field"><span id="oc-dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#8d9993;margin-right:8px"></span><span id="oc-state">—</span></div></div>
+			<div class="cbi-value"><label class="cbi-value-title"><%:Server%></label>
+				<div class="cbi-value-field"><code id="oc-upstream">—</code></div></div>
+			<div class="cbi-value"><label class="cbi-value-title"><%:Session age%></label>
+				<div class="cbi-value-field"><span id="oc-age">—</span> <span class="cbi-value-description"><%:sessions last 30 days%></span></div></div>
+			<div class="cbi-value"><label class="cbi-value-title"><%:Local URL%></label>
+				<div class="cbi-value-field"><code id="oc-url">—</code></div></div>
+			<div class="cbi-value"><label class="cbi-value-title"><%:Last error%></label>
+				<div class="cbi-value-field"><span id="oc-error">—</span></div></div>
+		</div>
+	</div>
+</section>
+
+<section id="oc-panel-connection" class="oc-panel" hidden>
+	<form method="post" action="<%=url("admin/tools/opencode/save")%>">
+	<input type="hidden" name="token" value="<%=token%>" />
+	<div class="cbi-section">
+		<h3><%:Connection%></h3>
+		<div class="cbi-section-node">
+			<div class="cbi-value"><label class="cbi-value-title"><%:Enabled%></label>
+				<div class="cbi-value-field"><input type="checkbox" name="enabled" value="1" <%=chk(enabled)%> /></div></div>
+			<div class="cbi-value"><label class="cbi-value-title"><%:Server URL%></label>
+				<div class="cbi-value-field"><input type="text" name="upstream" value="<%=pcdata(upstream)%>" placeholder="https://xxxx.opentunnel.xyz" style="width:100%" />
+					<div class="cbi-value-description"><%:Base URL of the OpenCode server — the OpenTunnel address from `opencode pair --remote`, or http://host:4096 for `opencode serve`.%></div></div></div>
+			<div class="cbi-value"><label class="cbi-value-title"><%:Server password%></label>
+				<div class="cbi-value-field"><input type="password" name="password" value="" placeholder="<%:blank = keep%>" size="26" />
+					<label style="margin-left:10px;font-weight:400"><input type="checkbox" name="clear_password" value="1" /> <%:clear%></label>
+					<div class="cbi-value-description"><%:The password `opencode serve` prints, or the one set with `opencode service set password`. Used to mint a pairing code.%></div></div></div>
+			<div class="cbi-value"><label class="cbi-value-title"><%:Pairing link%></label>
+				<div class="cbi-value-field"><input type="text" name="pair_url" value="<%=pcdata(pair_url)%>" placeholder="https://…/auth/connect/…" style="width:100%" />
+					<div class="cbi-value-description"><%:Optional one-time link from `opencode pair`. When set it is used instead of the password; links expire after five minutes and work once.%></div></div></div>
+			<div class="cbi-value"><label class="cbi-value-title"><%:Local port%></label>
+				<div class="cbi-value-field"><input type="text" name="port" value="<%=pcdata(port)%>" size="6" />
+					<div class="cbi-value-description"><%:The HTTP proxy port (used when the console is opened over plain HTTP).%></div></div></div>
+			<div class="cbi-value"><label class="cbi-value-title"><%:TLS%></label>
+				<div class="cbi-value-field"><input type="checkbox" name="insecure" value="1" <%=chk(insecure)%> /> <%:skip certificate verification (self-signed tunnel only)%></div></div>
+		</div>
+	</div>
+	<div class="cbi-page-actions">
+		<input class="btn cbi-button cbi-button-apply" type="submit" value="<%:Save & Apply%>" />
+	</div>
+	</form>
+</section>
+
+<style type="text/css">
+.oc-tabs { display:inline-flex; gap:2px; margin:0 0 16px; padding:3px; background:#EEF1EA; border-radius:10px; }
+.oc-tab { border:0; background:transparent; color:#3D4944; font:600 12.5px/1 var(--font-ui); padding:8px 16px; border-radius:8px; cursor:pointer; }
+.oc-tab:hover { color:#121916; }
+.oc-tab.is-active { background:#fff; color:#0A5A52; box-shadow:0 1px 2px rgba(14,20,18,.12); }
+.oc-toolbar { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin:0 0 8px; }
+.oc-tools { display:flex; gap:8px; flex-wrap:wrap; }
+</style>
+
+<%+footer%>

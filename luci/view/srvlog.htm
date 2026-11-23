@@ -1,0 +1,120 @@
+<%+header%>
+<%
+-- Generic per-service log viewer. The menu entry (last URL segment) selects
+-- which log tags are shown; see GROUPS below.
+
+local sys  = require "luci.sys"
+local util = require "luci.util"
+local pcdata = util.pcdata
+local disp = require "luci.dispatcher"
+
+local GROUPS = {
+	cloudflare = { title = "Cloudflare",      tags = { "cloudflare-ddns", "cloudflared" },
+	               note = "Dynamic DNS updater and tunnel connector, including the Cloudflare edge handshake." },
+	captiveportal = { title = "Captive Portal",   tags = { "captive-portal" },
+	               note = "Splash page service: start-up, acceptances and enforcement decisions." },
+	parental   = { title = "Parental Control", tags = { "parental" },
+	               note = "Rule application, block decisions (PTRL lines) and the sampler." },
+	vpn        = { title = "WireGuard / VPN",  tags = { "vpnsplit", "vpnplit", "wgvpn", "wghome", "wireguard", "wanfailover" },
+	               note = "Split-tunnel ipset sync, table-100 routes, the WireGuard interfaces and ISP/SIM failover." },
+	firewall   = { title = "Firewall",         tags = { "firewall", "fw3" },
+	               note = "fw3 reloads, includes and dropped packets." },
+	dhcpdns    = { title = "DHCP / DNS",       tags = { "dnsmasq", "odhcpd" },
+	               note = "Resolver, DHCP and router advertisements." },
+	sshweb     = { title = "SSH / Web / Cron", tags = { "dropbear", "uhttpd", "crond" },
+	               note = "Remote shell, the LuCI web server and scheduled jobs." },
+	siem       = { title = "SIEM Forwarding", tags = { "siem", "siem-forward" },
+	               note = "Local forwarder state: transport, delivery errors, spool backpressure and connection tests." }
+}
+
+local ORDER = { "cloudflare", "captiveportal", "parental", "vpn", "firewall", "dhcpdns", "sshweb", "siem" }
+
+local path = disp.context.requestpath or {}
+local key  = path[#path]
+if not GROUPS[key] then
+	local pi = (luci.http.getenv("PATH_INFO") or ""):gsub("/+$", "")
+	key = pi:match("([%w_]+)$")
+end
+if not GROUPS[key] then key = "cloudflare" end
+local g    = GROUPS[key]
+
+local pattern = table.concat(g.tags, "|")
+local limit   = 600
+
+local raw = sys.exec("logread 2>/dev/null | grep -Ei '" .. pattern .. "' | tail -n " .. limit) or ""
+local n = 0
+for _ in raw:gmatch("[^\n]+") do n = n + 1 end
+%>
+<h2 name="content"><%:Service log%>: <%=pcdata(g.title)%></h2>
+<p class="cbi-map-descr"><%=pcdata(g.note)%> <%:Entries come from logd (RAM ring buffer, lost on reboot). Newest are at the bottom.%></p>
+
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0">
+<% for _, k in ipairs(ORDER) do
+     local it = GROUPS[k]
+     local active = (k == key)
+%>
+	<a href="<%=url('admin/logs/services/' .. k)%>"
+	   style="padding:6px 12px;border-radius:16px;border:1px solid <%= active and "#2b6cb0" or "#ccc" %>;
+	          background:<%= active and "#2b6cb0" or "transparent" %>;color:<%= active and "#fff" or "inherit" %>;
+	          text-decoration:none;font-size:13px"><%=pcdata(it.title)%></a>
+<% end %>
+</div>
+
+<div class="cbi-section" style="padding:12px 16px;margin-bottom:14px">
+	<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+		<b><%=n%></b> <%:lines%>
+		<input id="sl-q" type="search" placeholder="<%:Filter log lines%>" style="flex:1;min-width:240px" oninput="slFilter()" />
+		<button type="button" class="btn" onclick="slDownload()"><%:Download%></button>
+		<button type="button" class="btn" onclick="slCopy(this)"><%:Copy log%></button>
+		<button type="button" class="btn" onclick="location.reload()"><%:Refresh%></button>
+	</div>
+</div>
+
+<% if n == 0 then %>
+<div class="cbi-section" style="padding:24px;text-align:center">
+	<p><%:Nothing logged for this service since the last reboot.%></p>
+</div>
+<% else %>
+<pre id="sl-view" style="max-height:68vh;overflow:auto;background:#f7f7f7;border:1px solid #ddd;border-radius:6px;padding:10px;margin:0;font-size:12px;line-height:1.45;white-space:pre-wrap;word-break:break-word"><%=pcdata(raw)%></pre>
+<% end %>
+
+<script type="text/javascript">
+//<![CDATA[
+var slFull = document.getElementById('sl-view') ? document.getElementById('sl-view').textContent : '';
+var slName = 'service-log-<%=key%>.log';
+
+function slFilter() {
+	var q = (document.getElementById('sl-q').value || '').toLowerCase();
+	var el = document.getElementById('sl-view');
+	if (!el) return;
+	if (!q) { el.textContent = slFull; return; }
+	el.textContent = slFull.split('\n').filter(function (l) {
+		return l.toLowerCase().indexOf(q) !== -1;
+	}).join('\n');
+}
+
+function slDownload() {
+	var blob = new Blob([slFull], { type: 'text/plain' });
+	var a = document.createElement('a');
+	a.href = URL.createObjectURL(blob);
+	a.download = slName;
+	document.body.appendChild(a);
+	a.click();
+	setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+}
+
+function slCopy(btn) {
+	var done = function () { var t = btn.textContent; btn.textContent = '<%:Copied%>'; setTimeout(function () { btn.textContent = t; }, 1200); };
+	if (navigator.clipboard && navigator.clipboard.writeText) {
+		navigator.clipboard.writeText(slFull).then(done, done);
+	} else {
+		var ta = document.createElement('textarea');
+		ta.value = slFull; document.body.appendChild(ta); ta.select();
+		try { document.execCommand('copy'); } catch (e) {}
+		ta.remove(); done();
+	}
+}
+//]]>
+</script>
+
+<%+footer%>

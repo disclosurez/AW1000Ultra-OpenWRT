@@ -1,0 +1,538 @@
+<%+header%>
+<%
+local sys  = require "luci.sys"
+local fs   = require "nixio.fs"
+local util = require "luci.util"
+local http = require "luci.http"
+local pcdata = util.pcdata
+
+local sel = http.formvalue("dev") or ""
+local scope = http.formvalue("scope") or "all"
+if scope ~= "lan" and scope ~= "guest" then scope = "all" end
+if sel ~= "" then scope = "all" end
+
+local function guest_ip(ip)
+	return ip:match("^192%.168%.5%.") ~= nil
+end
+
+local function in_scope(ip)
+	if scope == "all" then return true end
+	if scope == "guest" then return guest_ip(ip) end
+	return not guest_ip(ip)
+end
+
+local function dev_scope(d)
+	for ip in pairs(d.ips or {}) do
+		if guest_ip(ip) then return "guest" end
+	end
+	return "lan"
+end
+
+-- IP -> MAC / hostname maps (DHCP leases first, then neighbour tables)
+local ip2mac, mac2host = {}, {}
+local lease = fs.readfile("/tmp/dhcp.leases") or ""
+for line in lease:gmatch("[^\n]+") do
+	local _, mac, ip, host = line:match("^(%S+) (%S+) (%S+) (%S+)")
+	if mac and ip then
+		ip2mac[ip] = mac:lower()
+		if host ~= "*" then mac2host[mac:lower()] = host end
+	end
+end
+for _, dev in ipairs({ "br-lan", "br-guest" }) do
+	local n4 = sys.exec("ip -4 neigh show dev " .. dev .. " 2>/dev/null") or ""
+	for line in n4:gmatch("[^\n]+") do
+		local ip, mac = line:match("^(%d+%.%d+%.%d+%.%d+)%s+.-lladdr%s+(%S+)")
+		if ip and mac then ip2mac[ip] = mac:lower() end
+	end
+	local n6 = sys.exec("ip -6 neigh show dev " .. dev .. " 2>/dev/null") or ""
+	for line in n6:gmatch("[^\n]+") do
+		local ip, mac = line:match("^([%x:]+)%s+.-lladdr%s+(%S+)")
+		if ip and mac then ip2mac[ip:lower()] = mac:lower() end
+	end
+end
+
+local function sortcount(t)
+	local a = {}
+	for k, v in pairs(t) do a[#a + 1] = { k = k, v = v } end
+	table.sort(a, function(x, y)
+		if x.v == y.v then return x.k < y.k end
+		return x.v > y.v
+	end)
+	return a
+end
+
+local function countkeys(t)
+	local n = 0
+	for _ in pairs(t) do n = n + 1 end
+	return n
+end
+
+local function iplist(t)
+	local a = {}
+	for ip in pairs(t) do a[#a + 1] = ip end
+	table.sort(a)
+	return table.concat(a, ", ")
+end
+
+-- Index rows show one address plus a count; the drill-down lists them all.
+local function ipfirst(t)
+	local a = {}
+	for ip in pairs(t) do a[#a + 1] = ip end
+	table.sort(a)
+	if #a == 0 then return "—", 0 end
+	return a[1], #a
+end
+
+local function shortname(d)
+	if d.mac ~= "" and mac2host[d.mac] then return mac2host[d.mac] end
+	if d.mac ~= "" then return d.mac end
+	return d.ip or "unknown"
+end
+
+local function hourlabel(hk)
+	local mon, day, hr = hk:match("^(%a+)%s+(%d+)%s+(%d%d)$")
+	if mon then return day .. " " .. mon .. " " .. hr .. ":00" end
+	return hk
+end
+
+-- MAC vendor database (Wireshark manuf, refreshed by /usr/sbin/oui-update)
+local oui = {}
+local of = io.open("/data/oui/oui.tsv", "r")
+if of then
+	for line in of:lines() do
+		local p, v = line:match("^(%x+)\t(.+)$")
+		if p then oui[p] = v end
+	end
+	of:close()
+end
+local function vendor(mac)
+	if not mac or mac == "" then return "—" end
+	local s = mac:lower():gsub(":", "")
+	return oui[s:sub(1,10)] or oui[s:sub(1,9)] or oui[s:sub(1,7)] or oui[s:sub(1,6)] or "—"
+end
+
+-- Local DNS category database (nDPI + /data/dnscat/custom.tsv overrides)
+local cat_map = {}
+local cat_rank = {
+	["Adult"] = 1, ["Ads & tracking"] = 2, ["Security"] = 3,
+	["VPN / proxy"] = 4, ["Downloads"] = 5, ["Gaming"] = 6,
+	["Streaming"] = 7, ["Social"] = 8, ["Shopping"] = 9,
+	["Finance"] = 10, ["News"] = 11, ["Education"] = 12,
+	["Government"] = 13, ["Health"] = 14, ["Communication"] = 15,
+	["Cloud / CDN"] = 16, ["Software"] = 17, ["Developer"] = 18,
+	["Business"] = 19, ["IoT"] = 20, ["Infrastructure"] = 21,
+	["Web"] = 22, ["Weapons"] = 23, ["Violence"] = 24,
+	["Drugs"] = 25, ["Children"] = 26, ["Remote access"] = 27,
+	["Other"] = 50
+}
+local function setcat(domain, cat, force)
+	domain = domain:lower():gsub("^%*?%.?", ""):gsub("%.$", "")
+	if domain == "" or not domain:find(".", 1, true) then return end
+	if force or not cat_map[domain] or
+	   (cat_rank[cat] or 50) < (cat_rank[cat_map[domain]] or 50) then
+		cat_map[domain] = cat
+	end
+end
+local function loadcats(path, force)
+	local f = io.open(path, "r")
+	local n = 0
+	if not f then return n end
+	for line in f:lines() do
+		if line:sub(1, 1) ~= "#" then
+			local d, c = line:match("^([^\t]+)\t(.+)$")
+			if d and c then
+				setcat(d, c, force)
+				n = n + 1
+			end
+		end
+	end
+	f:close()
+	return n
+end
+local n_native = loadcats("/data/dnscat/ndpi.tsv", false)
+local n_custom = loadcats("/data/dnscat/custom.tsv", true)
+local cat_loaded = (n_native + n_custom) > 0
+
+local cat_cache = {}
+local function categorize(dom)
+	local d = dom:lower():gsub("%.$", "")
+	local hit = cat_cache[d]
+	if hit then return hit end
+	local parts = {}
+	for p in d:gmatch("[^%.]+") do parts[#parts + 1] = p end
+	for i = 1, #parts do
+		local c = cat_map[table.concat(parts, ".", i)]
+		if c then cat_cache[d] = c; return c end
+	end
+	cat_cache[d] = "Uncategorized"
+	return "Uncategorized"
+end
+
+local cat_color = {
+	["Adult"] = "#b3261e", ["Ads & tracking"] = "#6b7280",
+	["Security"] = "#9a3412", ["VPN / proxy"] = "#5b21b6",
+	["Streaming"] = "#7c3aed", ["Social"] = "#1d4ed8",
+	["Gaming"] = "#047857", ["Shopping"] = "#b45309",
+	["Finance"] = "#0f766e", ["Communication"] = "#0369a1",
+	["Cloud / CDN"] = "#0e7490", ["Software"] = "#374151",
+	["Developer"] = "#4338ca", ["Infrastructure"] = "#065f46",
+	["Web"] = "#4b5563", ["Uncategorized"] = "#9ca3af"
+}
+local function catbadge(c)
+	local col = cat_color[c] or "#4b5563"
+	return string.format('<span style="display:inline-block;padding:1px 7px;border:1px solid %s;border-radius:10px;font-size:12px;line-height:1.5;color:%s;white-space:nowrap">%s</span>',
+		col, col, pcdata(c))
+end
+
+-- Parse the current dnsmasq log
+local raw = sys.exec("tail -n 50000 /data/logs/dns.log 2>/dev/null") or ""
+local devs, recent = {}, {}
+local total = 0
+local all_domains = {}
+
+for line in raw:gmatch("[^\n]+") do
+	local ts, ip, qtype, dom = line:match("^(%a+%s+%d+%s+%d+:%d+:%d+)%s+dnsmasq%[[^%]]*%]:%s+%d+%s+([%x:%.]+)/%d+%s+query%[(%u+)%]%s+(%S+)")
+
+	if ts and ip and dom and ip ~= "127.0.0.1" and ip ~= "::1" and
+	   dom ~= "." and not dom:match("%.arpa$") and dom ~= "localhost" and
+	   not dom:match("^%d+%.%d+%.%d+%.%d+$") and in_scope(ip) then
+		local mac = ip2mac[ip:lower()] or ""
+		local key = (mac ~= "") and mac or ip:lower()
+		local d = devs[key]
+
+		if not d then
+			d = {
+				key = key, mac = mac, ip = ip, ips = {},
+				queries = 0, domains = {}, types = {}, cats = {},
+				first = ts, last = ts, hours = {}, hour_order = {}
+			}
+			devs[key] = d
+		end
+
+		local cat = categorize(dom)
+		d.ips[ip] = true
+		d.queries = d.queries + 1
+		d.domains[dom] = (d.domains[dom] or 0) + 1
+		d.types[qtype] = (d.types[qtype] or 0) + 1
+		d.cats[cat] = (d.cats[cat] or 0) + 1
+		d.last = ts
+
+		local hk = ts:sub(1, 9)
+		if not d.hours[hk] then
+			d.hours[hk] = 0
+			d.hour_order[#d.hour_order + 1] = hk
+		end
+		d.hours[hk] = d.hours[hk] + 1
+
+		total = total + 1
+		all_domains[dom] = (all_domains[dom] or 0) + 1
+
+		recent[#recent + 1] = { ts = ts, ip = ip, mac = mac, dom = dom, qtype = qtype, key = key, cat = cat }
+	end
+end
+
+local target = ""
+if sel ~= "" then
+	target = ip2mac[sel:lower()] or sel:lower()
+end
+local td = (target ~= "") and devs[target] or nil
+
+local device_list = {}
+for _, d in pairs(devs) do device_list[#device_list + 1] = d end
+table.sort(device_list, function(a, b)
+	if a.queries == b.queries then return a.last > b.last end
+	return a.queries > b.queries
+end)
+
+local max_queries = 0
+for _, d in ipairs(device_list) do
+	if d.queries > max_queries then max_queries = d.queries end
+	local tcats = sortcount(d.cats)
+	d.topcat = tcats[1] and tcats[1].k or "Uncategorized"
+	d.catcount = #tcats
+end
+
+local cat_set = {}
+for _, r in ipairs(recent) do cat_set[r.cat] = true end
+local cat_options = {}
+for c in pairs(cat_set) do cat_options[#cat_options + 1] = c end
+table.sort(cat_options, function(a, b)
+	if a == "Uncategorized" then return false end
+	if b == "Uncategorized" then return true end
+	return a < b
+end)
+
+local dev_queries = {}
+if td then
+	for i = #recent, 1, -1 do
+		if recent[i].key == target then
+			dev_queries[#dev_queries + 1] = recent[i]
+			if #dev_queries >= 1000 then break end
+		end
+	end
+end
+
+local blocked_raw = sys.exec("logread -e 'PTRL-DOM' 2>/dev/null | tail -n 8") or ""
+local blocked_all = tonumber(sys.exec("logread -e 'PTRL-DOM' 2>/dev/null | wc -l") or "0") or 0
+local size = fs.stat("/data/logs/dns.log")
+local qlabel = "Filter queries by client, MAC, type or domain"
+%>
+<h2 name="content"><%:DNS Query Log%></h2>
+<p class="cbi-map-descr"><%:Per-device DNS history from dnsmasq, kept for the current 12-hour window (cleared at 00:00 and 12:00 UTC). Click a device to see only its queries. Categories are matched locally from the nDPI database plus /data/dnscat/custom.tsv. Only clients using the router as DNS appear; DoH traffic is invisible.%></p>
+
+<% if target == "" then %>
+<div class="cbi-section" style="padding:10px 16px;margin:14px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+	<span class="cbi-section-descr"><%:Scope%>:</span>
+	<a class="btn <%= (scope == "all") and "btn-primary" or "" %>" href="<%=url('admin/logs/dnslog')%>?scope=all"><%:All%></a>
+	<a class="btn <%= (scope == "lan") and "btn-primary" or "" %>" href="<%=url('admin/logs/dnslog')%>?scope=lan"><%:LAN%></a>
+	<a class="btn <%= (scope == "guest") and "btn-primary" or "" %>" href="<%=url('admin/logs/dnslog')%>?scope=guest"><%:Guest Wireless%></a>
+	<span class="cbi-section-descr"><%:Guest Wireless is 192.168.5.0/24; LAN is the main 192.168.0.0/24.%></span>
+</div>
+<% end %>
+
+<% if not cat_loaded then %>
+<div class="alert-message warning"><%:Category database not installed. Run%> <code>/usr/sbin/dnscat-update</code> <%:or upload%> <code>/data/dnscat/ndpi.tsv</code>.</div>
+<% end %>
+
+<% if target == "" then %>
+<div style="display:flex;gap:12px;flex-wrap:wrap;margin:14px 0">
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=total%></b><br><%:queries%></div>
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=#device_list%></b><br><%:devices%></div>
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=countkeys(all_domains)%></b><br><%:domains%></div>
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=blocked_all%></b><br><%:blocked hits%></div>
+</div>
+
+<div class="cbi-section" style="padding:12px 16px;margin-bottom:16px">
+	<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+		<input id="dns-q" type="search" placeholder="<%=qlabel%>" style="flex:1;min-width:260px" oninput="dnsFilter()" />
+		<select id="dns-cat" onchange="dnsFilter()" style="min-width:170px">
+			<option value=""><%:All categories%></option>
+			<% for _, c in ipairs(cat_options) do %>
+			<option value="<%=pcdata(c)%>"><%=pcdata(c)%></option>
+			<% end %>
+		</select>
+		<button type="button" class="btn" onclick="awLog.downloadTable('dns-recent','dns-queries.csv')"><%:Download%></button>
+		<button type="button" class="btn" onclick="awLog.copyTable('dns-recent', this)"><%:Copy log%></button>
+		<button type="button" class="btn" onclick="location.reload()"><%:Refresh%></button>
+	</div>
+</div>
+
+<h3><%:Devices%> <span class="cbi-section-descr" style="font-weight:400">(<%=#device_list%>)</span></h3>
+<div class="dns-scroll">
+<table class="cbi-section-table" id="dns-devs">
+	<thead><tr>
+		<th><%:Device%></th>
+		<th><%:IP%></th>
+		<th style="text-align:right"><%:Queries%></th>
+		<th style="text-align:right"><%:Domains%></th>
+		<th><%:Category%></th>
+		<th><%:Top domains%></th>
+		<th><%:Last seen%></th>
+		<th></th>
+	</tr></thead>
+	<tbody>
+	<% for _, d in ipairs(device_list) do
+		local td2 = sortcount(d.domains)
+		local top = {}
+		for i = 1, math.min(3, #td2) do top[i] = td2[i].k end
+		local pct = max_queries > 0 and math.floor(d.queries * 100 / max_queries) or 0
+		local firstip, nip = ipfirst(d.ips)
+		local href = url('admin/logs/dnslog') .. "?dev=" .. d.key
+	%>
+	<tr data-cat="<%=pcdata(d.topcat)%>">
+		<td><a href="<%=pcdata(href)%>"><%=pcdata(shortname(d))%></a>
+			<% if d.mac ~= "" then %>
+			<% if shortname(d) ~= d.mac then %><div class="mono" style="font-size:12px"><%=pcdata(d.mac)%></div><% end %>
+			<div class="cbi-section-descr" style="font-size:12px;max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="<%=pcdata(vendor(d.mac))%>"><%=pcdata(vendor(d.mac))%></div>
+			<% end %>
+		</td>
+		<td class="mono" title="<%=pcdata(iplist(d.ips))%>"><%=pcdata(firstip)%><% if nip > 1 then %> <span class="dns-more">+<%=nip-1%></span><% end %></td>
+		<td style="text-align:right" data-label="<%:Queries%>"><%=d.queries%>
+			<div style="height:4px;background:#e7ebe6;border-radius:2px;margin-top:3px"><div style="height:4px;width:<%=pct%>%;background:#2f7d6a;border-radius:2px"></div></div>
+		</td>
+		<td style="text-align:right" data-label="<%:Domains%>"><%=#td2%></td>
+		<td data-label="<%:Category%>"><%=catbadge(d.topcat)%></td>
+		<td><%=pcdata(table.concat(top, ", "))%></td>
+		<td><%=pcdata(d.last)%></td>
+		<td><a class="btn" href="<%=pcdata(href)%>"><%:View%></a></td>
+	</tr>
+	<% end %>
+	<% if #device_list == 0 then %><tr><td colspan="8"><em><%:No DNS queries in the current window.%></em></td></tr><% end %>
+	</tbody>
+</table>
+</div>
+
+<h3 style="margin-top:20px"><%:Recent queries%></h3>
+<div style="max-height:420px;overflow:auto">
+<table class="cbi-section-table" id="dns-recent">
+	<thead><tr><th><%:Time%></th><th><%:Type%></th><th><%:Client%></th><th><%:Device%></th><th><%:Category%></th><th><%:Domain%></th></tr></thead>
+	<tbody>
+	<%
+	local shown = 0
+	for i = #recent, 1, -1 do
+		local r = recent[i]
+		if shown < 300 then
+			shown = shown + 1
+	%>
+	<tr data-cat="<%=pcdata(r.cat)%>">
+		<td><%=pcdata(r.ts)%></td>
+		<td><span style="padding:1px 6px;border:1px solid #cfd8d0;border-radius:10px;font-size:12px"><%=pcdata(r.qtype)%></span></td>
+		<td class="mono"><%=pcdata(r.ip)%></td>
+		<td class="mono" style="font-size:12px"><%=pcdata(r.mac ~= "" and r.mac or "—")%></td>
+		<td><%=catbadge(r.cat)%></td>
+		<td><%=pcdata(r.dom)%></td>
+	</tr>
+	<%
+		end
+	end
+	if #recent == 0 then %><tr><td colspan="6"><em><%:No DNS queries logged yet.%></em></td></tr><% end %>
+	</tbody>
+</table>
+</div>
+
+<details style="margin-top:18px">
+	<summary style="cursor:pointer"><b><%:Blocked domain hits%></b> (<%=blocked_all%>)</summary>
+	<pre style="max-height:180px;overflow:auto;background:#f7f7f7;padding:8px;border:1px solid #ddd;font-size:12px"><%=pcdata(blocked_raw)%></pre>
+</details>
+
+<% else %>
+<%
+local back_scope = "all"
+if td then back_scope = dev_scope(td) end
+%>
+<p style="margin:6px 0 16px"><a class="btn" href="<%=url('admin/logs/dnslog')%>?scope=<%=back_scope%>">&larr; <%:All devices%></a></p>
+
+<% if not td then %>
+	<div class="alert-message warning"><%:No queries for this device in the current 12-hour window. The log is cleared at 00:00 and 12:00 UTC.%></div>
+<% else
+	local tdom = sortcount(td.domains)
+	local ttypes = sortcount(td.types)
+	local tcats = sortcount(td.cats)
+	cat_options = {}
+	for c in pairs(td.cats) do cat_options[#cat_options + 1] = c end
+	table.sort(cat_options, function(a, b)
+		if a == "Uncategorized" then return false end
+		if b == "Uncategorized" then return true end
+		return a < b
+	end)
+	local maxdom = tdom[1] and tdom[1].v or 1
+	local maxhour = 0
+	for _, n in pairs(td.hours) do if n > maxhour then maxhour = n end end
+%>
+<div class="cbi-section" style="padding:14px 18px;display:flex;gap:16px;flex-wrap:wrap;justify-content:space-between;align-items:flex-start;margin-bottom:14px">
+	<div>
+		<div style="font-size:1.2em;font-weight:600"><%=pcdata(shortname(td))%></div>
+		<div style="margin-top:6px"><span class="cbi-section-descr"><%:IP address%>:</span> <span class="mono"><%=pcdata(iplist(td.ips))%></span></div>
+		<% if td.mac ~= "" then %>
+		<% if shortname(td) ~= td.mac then %><div style="margin-top:2px"><span class="cbi-section-descr"><%:MAC%>:</span> <span class="mono"><%=pcdata(td.mac)%></span></div><% end %>
+		<div style="margin-top:2px"><span class="cbi-section-descr"><%:Manufacturer%>:</span> <%=pcdata(vendor(td.mac))%></div>
+		<% end %>
+		<div style="margin-top:2px"><span class="cbi-section-descr"><%:Scope%>:</span> <b><%= (back_scope == "guest") and "Guest Wireless" or "LAN" %></b></div>
+		<div style="margin-top:2px"><span class="cbi-section-descr"><%:Top category%>:</span> <%=catbadge(tcats[1] and tcats[1].k or "Uncategorized")%></div>
+		<div class="cbi-section-descr" style="margin-top:4px"><%:First seen%> <%=pcdata(td.first)%> · <%:Last seen%> <%=pcdata(td.last)%></div>
+	</div>
+	<div style="text-align:right">
+		<div style="font-size:1.5em;font-weight:600"><%=td.queries%></div>
+		<div class="cbi-section-descr"><%:queries this window%></div>
+	</div>
+</div>
+
+<div style="display:flex;gap:12px;flex-wrap:wrap;margin:14px 0">
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=#tdom%></b><br><%:unique domains%></div>
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=#ttypes%></b><br><%:query types%></div>
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=#td.hour_order%></b><br><%:active hours%></div>
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=#tcats%></b><br><%:categories%></div>
+</div>
+
+<div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:18px">
+	<div style="flex:1;min-width:300px">
+		<h3><%:Top domains%></h3>
+		<table class="cbi-section-table">
+			<thead><tr><th><%:Domain%></th><th><%:Category%></th><th style="text-align:right"><%:Count%></th></tr></thead>
+			<tbody>
+			<% for i = 1, math.min(12, #tdom) do local x = tdom[i]; local pct = math.floor(x.v * 100 / maxdom); local c = categorize(x.k) %>
+			<tr>
+				<td><%=pcdata(x.k)%>
+					<div style="height:4px;background:#e7ebe6;border-radius:2px;margin-top:3px"><div style="height:4px;width:<%=pct%>%;background:#2f7d6a;border-radius:2px"></div></div>
+				</td>
+				<td><%=catbadge(c)%></td>
+				<td style="text-align:right"><%=x.v%></td>
+			</tr>
+			<% end %>
+			</tbody>
+		</table>
+	</div>
+	<div style="flex:1;min-width:300px">
+		<h3><%:Activity by hour%></h3>
+		<table class="cbi-section-table">
+			<thead><tr><th><%:Hour%></th><th><%:Queries%></th></tr></thead>
+			<tbody>
+			<% for _, hk in ipairs(td.hour_order) do local n = td.hours[hk]; local pct = math.floor(n * 100 / maxhour) %>
+			<tr>
+				<td class="mono" style="white-space:nowrap"><%=pcdata(hourlabel(hk))%></td>
+				<td><div style="display:flex;gap:8px;align-items:center"><div style="flex:1;height:6px;background:#e7ebe6;border-radius:3px"><div style="height:6px;width:<%=pct%>%;background:#2f7d6a;border-radius:3px"></div></div><span style="min-width:38px;text-align:right"><%=n%></span></div></td>
+			</tr>
+			<% end %>
+			</tbody>
+		</table>
+	</div>
+</div>
+
+<h3 style="margin-top:20px"><%:Queries from this device%></h3>
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+	<input id="dns-q" type="search" placeholder="<%=qlabel%>" style="flex:1;min-width:260px" oninput="dnsFilter()" />
+	<select id="dns-cat" onchange="dnsFilter()" style="min-width:170px">
+		<option value=""><%:All categories%></option>
+		<% for _, c in ipairs(cat_options) do %>
+		<option value="<%=pcdata(c)%>"><%=pcdata(c)%></option>
+		<% end %>
+	</select>
+	<button type="button" class="btn" onclick="awLog.downloadTable('dns-recent','dns-queries.csv')"><%:Download%></button>
+	<button type="button" class="btn" onclick="awLog.copyTable('dns-recent', this)"><%:Copy log%></button>
+	<button type="button" class="btn" onclick="location.reload()"><%:Refresh%></button>
+</div>
+<div style="max-height:460px;overflow:auto">
+<table class="cbi-section-table" id="dns-recent">
+	<thead><tr><th><%:Time%></th><th><%:Client%></th><th><%:Type%></th><th><%:Category%></th><th><%:Domain%></th></tr></thead>
+	<tbody>
+	<% for _, r in ipairs(dev_queries) do %>
+	<tr data-cat="<%=pcdata(r.cat)%>">
+		<td><%=pcdata(r.ts)%></td>
+		<td class="mono"><%=pcdata(r.ip)%></td>
+		<td><span style="padding:1px 6px;border:1px solid #cfd8d0;border-radius:10px;font-size:12px"><%=pcdata(r.qtype)%></span></td>
+		<td><%=catbadge(r.cat)%></td>
+		<td><%=pcdata(r.dom)%></td>
+	</tr>
+	<% end %>
+	<% if #dev_queries == 0 then %><tr><td colspan="5"><em><%:No queries for this device.%></em></td></tr><% end %>
+	</tbody>
+</table>
+</div>
+<% if td.queries > #dev_queries then %>
+<p class="cbi-section-descr"><%:Showing the most recent%> <%=#dev_queries%> <%:of%> <%=td.queries%> <%:queries.%></p>
+<% end %>
+<% end %>
+<% end %>
+
+<% if size then %>
+<p class="cbi-section-descr"><%:Log%>: <code>/data/logs/dns.log</code> — <%=string.format("%.1f", size.size / 1024 / 1024)%> MB, 20 MB cap.</p>
+<% end %>
+
+<script type="text/javascript">
+function dnsFilter() {
+	var q = (document.getElementById('dns-q').value || '').toLowerCase();
+	var sel = document.getElementById('dns-cat');
+	var cat = sel ? sel.value : '';
+	var tables = ['dns-recent', 'dns-devs'];
+	for (var t = 0; t < tables.length; t++) {
+		var rows = document.querySelectorAll('#' + tables[t] + ' tbody tr');
+		for (var i = 0; i < rows.length; i++) {
+			var txt = (rows[i].innerText || rows[i].textContent || '').toLowerCase();
+			var rowcat = rows[i].getAttribute('data-cat') || '';
+			var ok = (!q || txt.indexOf(q) !== -1) && (!cat || rowcat === cat);
+			rows[i].style.display = ok ? '' : 'none';
+		}
+	}
+}
+</script>
+<%+footer%>

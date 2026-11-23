@@ -1,0 +1,3 @@
+#!/bin/sh
+# Re-apply the Web Viewer's VPN policy mark after every fw3 reload.
+[ -x /usr/sbin/webview-vpn ] && /usr/sbin/webview-vpn apply >/dev/null 2>&1

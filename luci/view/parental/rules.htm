@@ -1,0 +1,225 @@
+<%+header%>
+<%
+local uci = require "luci.model.uci".cursor()
+local util = require "luci.util"
+local fs = require "nixio.fs"
+local pcdata = util.pcdata
+local days_all = { "mon", "tue", "wed", "thu", "fri", "sat", "sun" }
+local days_label = { mon = "Mon", tue = "Tue", wed = "Wed", thu = "Thu", fri = "Fri", sat = "Sat", sun = "Sun" }
+local rules = {}
+uci:foreach("parental", "device", function(s)
+	rules[#rules + 1] = s
+end)
+
+-- Devices seen on the LAN, offered as MAC suggestions.
+local oui = {}
+local of = io.open("/data/oui/oui.tsv", "r")
+if of then
+	for line in of:lines() do
+		local p, v = line:match("^(%x+)\t(.+)$")
+		if p then oui[p] = v end
+	end
+	of:close()
+end
+local function vendor(mac)
+	local s = mac:lower():gsub(":", "")
+	return oui[s:sub(1, 10)] or oui[s:sub(1, 9)] or oui[s:sub(1, 7)] or oui[s:sub(1, 6)] or "unknown"
+end
+
+local known, seen = {}, {}
+local lease = fs.readfile("/tmp/dhcp.leases") or ""
+local host_by_mac = {}
+for line in lease:gmatch("[^\n]+") do
+	local _, mac, ip, host = line:match("^(%S+) (%S+) (%S+) (%S+)")
+	if mac then host_by_mac[mac:lower()] = (host ~= "*") and host or "" end
+end
+local arp = fs.readfile("/proc/net/arp") or ""
+for line in arp:gmatch("[^\n]+") do
+	local ip, mac = line:match("^(%d+%.%d+%.%d+%.%d+)%s+%S+%s+%S+%s+(%S+)")
+	if ip and mac and mac ~= "00:00:00:00:00:00" then
+		local m = mac:lower()
+		if not seen[m] then
+			seen[m] = true
+			local host = host_by_mac[m] or ""
+			known[#known + 1] = { mac = m, ip = ip, host = host, vendor = vendor(m) }
+		end
+	end
+end
+table.sort(known, function(a, b)
+	if a.ip ~= b.ip then
+		local ai = tonumber(a.ip:match("%.(%d+)$")) or 0
+		local bi = tonumber(b.ip:match("%.(%d+)$")) or 0
+		return ai < bi
+	end
+	return a.mac < b.mac
+end)
+%>
+<h2 name="content"><%:Parental Control — Blocking Rules%></h2>
+<p class="cbi-map-descr"><%:Block internet access per device, either permanently or outside the allowed hours. Rules are checked every minute, take effect immediately, and survive reboots. Blocked devices keep access to the router and the local network.%></p>
+
+<form method="post" action="<%=url('admin/network/parental/save')%>" id="pc-form">
+<input type="hidden" name="token" value="<%=token%>" />
+<input type="hidden" name="count" id="pc-count" value="<%=#rules%>" />
+
+<datalist id="pc-devices">
+	<% for _, d in ipairs(known) do %>
+	<option value="<%=pcdata(d.mac)%>"><%=pcdata(d.ip .. " · " .. d.mac .. " · " .. d.vendor .. (d.host ~= "" and (" · " .. d.host) or ""))%></option>
+	<% end %>
+</datalist>
+
+<div class="pc-empty" id="pc-empty" <%= (#rules > 0) and "hidden" or "" %>>
+	<svg class="icon" viewBox="0 0 24 24"><use href="#i-shield"/></svg>
+	<h4><%:No devices are restricted%></h4>
+	<p><%:Add a device to pause its internet access on a schedule, or block it entirely. Its MAC address is on the Devices & Activity tab.%></p>
+	<button type="button" class="btn btn-primary" onclick="pcAddRow()"><%:Add the first device%></button>
+</div>
+
+<div class="pc-toolbar" style="margin:10px 0">
+	<button type="button" class="btn btn-primary" onclick="pcAddRow()"><%:Add device%></button>
+</div>
+
+<div class="pc-scroll" id="pc-table-wrap" <%= (#rules == 0) and "hidden" or "" %>>
+<table class="cbi-section-table pc-table">
+	<thead>
+	<tr>
+		<th style="width:36px" title="<%:Rule enabled%>"><%:On%></th>
+		<th><%:Device name%></th>
+		<th><%:MAC address%></th>
+		<th><%:Mode%></th>
+		<th><%:Allowed days%></th>
+		<th><%:From%></th>
+		<th><%:Until%></th>
+		<th style="width:44px"></th>
+	</tr>
+	</thead>
+	<tbody id="pc-body">
+	<% for i, r in ipairs(rules) do
+		local active_days = {}
+		for d in (r.days or ""):gmatch("%S+") do active_days[d] = true end
+	%>
+	<tr>
+		<td><input type="checkbox" name="enabled<%=i%>" value="1" data-field="enabled" aria-label="<%:Rule enabled%>"<%= (r.enabled ~= "0") and " checked" or "" %> /></td>
+		<td><input type="text" name="name<%=i%>" value="<%=pcdata(r.name or "")%>" data-field="name" placeholder="<%:e.g. Kids tablet%>" /></td>
+		<td>
+			<select name="mac<%=i%>" data-field="mac" class="pc-macsel" style="max-width:280px" aria-label="<%:MAC address%>">
+				<option value="<%=pcdata(r.mac or "")%>"><%=pcdata(r.mac or "— select device —")%></option>
+				<% for _, d in ipairs(known) do %>
+				<option value="<%=pcdata(d.mac)%>"><%=pcdata(d.ip .. " · " .. d.mac .. " · " .. d.vendor .. (d.host ~= "" and (" · " .. d.host) or ""))%></option>
+				<% end %>
+				<option value="__manual__"><%:Other / type MAC…%></option>
+			</select>
+			<input type="text" name="mac_manual<%=i%>" data-field="mac_manual" value="" class="pc-macmanual" style="width:150px;margin-top:4px" placeholder="<%:or type MAC%>" spellcheck="false" autocapitalize="none" aria-label="<%:Other MAC address%>" />
+		</td>
+		<td>
+			<select name="mode<%=i%>" data-field="mode" aria-label="<%:Mode%>">
+				<option value="schedule"<%= (r.mode ~= "ban") and " selected" or "" %>><%:Scheduled access%></option>
+				<option value="ban"<%= (r.mode == "ban") and " selected" or "" %>><%:Always blocked%></option>
+			</select>
+		</td>
+		<td class="pc-days">
+			<% for _, d in ipairs(days_all) do %>
+			<label class="pc-day"><input type="checkbox" name="day_<%=d%><%=i%>" value="1" data-field="day_<%=d%>"<%= active_days[d] and " checked" or "" %> /><%=days_label[d]%></label>
+			<% end %>
+		</td>
+		<td><input type="text" name="start<%=i%>" value="<%=pcdata(r.start or "07:00")%>" data-field="start" placeholder="07:00" spellcheck="false" aria-label="<%:From%>" /></td>
+		<td><input type="text" name="end<%=i%>" value="<%=pcdata(r["end"] or "21:00")%>" data-field="end" placeholder="21:00" spellcheck="false" aria-label="<%:Until%>" /></td>
+		<td><button type="button" class="cbi-button cbi-button-remove pc-remove" onclick="pcRemoveRow(this)" aria-label="<%:Remove rule%>" title="<%:Remove rule%>">×</button></td>
+	</tr>
+	<% end %>
+	</tbody>
+</table>
+</div>
+
+<div class="cbi-page-actions">
+	<button type="submit" class="cbi-button cbi-button-apply"><%:Save & Apply%></button>
+</div>
+</form>
+
+<script type="text/javascript">//<![CDATA[
+var PC_DAYS = ["mon","tue","wed","thu","fri","sat","sun"];
+var PC_LABELS = {mon:"Mon",tue:"Tue",wed:"Wed",thu:"Thu",fri:"Fri",sat:"Sat",sun:"Sun"};
+var PC_KNOWN = <%=luci.util.serialize_json(known)%>;
+
+function pcEsc(s) {
+	return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function pcSyncEmpty() {
+	var rows = document.querySelectorAll('#pc-body tr');
+	document.getElementById('pc-count').value = rows.length;
+	var empty = document.getElementById('pc-empty');
+	var wrap = document.getElementById('pc-table-wrap');
+	if (empty) empty.hidden = rows.length > 0;
+	if (wrap) wrap.hidden = rows.length === 0;
+}
+
+function pcRenumber() {
+	var rows = document.querySelectorAll('#pc-body tr');
+	document.getElementById('pc-count').value = rows.length;
+	for (var i = 0; i < rows.length; i++) {
+		var idx = i + 1;
+		var fields = rows[i].querySelectorAll('[data-field]');
+		for (var j = 0; j < fields.length; j++) {
+			fields[j].name = fields[j].getAttribute('data-field') + idx;
+		}
+	}
+	pcSyncEmpty();
+}
+
+function pcAddRow() {
+	var body = document.getElementById('pc-body');
+	var tr = document.createElement('tr');
+	var cells = [];
+
+	cells.push('<td><input type="checkbox" value="1" data-field="enabled" checked aria-label="{{ON}}" /></td>');
+	cells.push('<td><input type="text" data-field="name" placeholder="{{NAME}}" /></td>');
+	var macHtml = '<select data-field="mac" class="pc-macsel" style="max-width:280px">' +
+		'<option value="">— select device —</option>';
+	for (var k = 0; k < PC_KNOWN.length; k++) {
+		var kd = PC_KNOWN[k];
+		macHtml += '<option value="' + pcEsc(kd.mac) + '">' +
+			pcEsc(kd.ip + ' · ' + kd.mac + ' · ' + kd.vendor + (kd.host ? ' · ' + kd.host : '')) +
+			'</option>';
+	}
+	macHtml += '<option value="__manual__">Other / type MAC…</option></select>' +
+		'<input type="text" data-field="mac_manual" class="pc-macmanual" style="width:150px;margin-top:4px" placeholder="or type MAC" spellcheck="false" autocapitalize="none" />';
+	cells.push('<td>' + macHtml + '</td>');
+	cells.push('<td><select data-field="mode" aria-label="{{MODE}}">' +
+		'<option value="schedule">{{SCHED}}</option>' +
+		'<option value="ban">{{BAN}}</option></select></td>');
+
+	var dayHtml = '<td class="pc-days">';
+	for (var d = 0; d < PC_DAYS.length; d++) {
+		dayHtml += '<label class="pc-day"><input type="checkbox" value="1" data-field="day_' +
+			PC_DAYS[d] + '" checked />' + PC_LABELS[PC_DAYS[d]] + '</label>';
+	}
+	dayHtml += '</td>';
+	cells.push(dayHtml);
+
+	cells.push('<td><input type="text" data-field="start" value="07:00" spellcheck="false" aria-label="{{FROM}}" /></td>');
+	cells.push('<td><input type="text" data-field="end" value="21:00" spellcheck="false" aria-label="{{UNTIL}}" /></td>');
+	cells.push('<td><button type="button" class="cbi-button cbi-button-remove pc-remove" onclick="pcRemoveRow(this)" aria-label="{{REMOVE}}" title="{{REMOVE}}">×</button></td>');
+
+	tr.innerHTML = cells.join('')
+		.replace('{{ON}}', '<%:Rule enabled%>')
+		.replace('{{NAME}}', '<%:e.g. Kids tablet%>')
+		.replace('{{MODE}}', '<%:Mode%>')
+		.replace('{{SCHED}}', '<%:Scheduled access%>')
+		.replace('{{BAN}}', '<%:Always blocked%>')
+		.replace('{{FROM}}', '<%:From%>')
+		.replace('{{UNTIL}}', '<%:Until%>')
+		.replace('{{REMOVE}}', '<%:Remove rule%>');
+	body.appendChild(tr);
+	pcRenumber();
+	tr.querySelector('input[data-field="name"]').focus();
+}
+
+function pcRemoveRow(btn) {
+	var row = btn.closest('tr');
+	if (row) row.parentNode.removeChild(row);
+	pcRenumber();
+}
+
+document.addEventListener('DOMContentLoaded', pcRenumber);
+//]]></script>
+<%+footer%>

@@ -1,0 +1,109 @@
+# Local DNS category overrides. Matches the domain and all subdomains.
+# Format: domain<TAB>category
+# Edit freely, then reload the DNS Log page (no restart needed).
+
+# Developer / code hosting
+github.com	Developer
+githubusercontent.com	Developer
+githubassets.com	Developer
+ghcr.io	Developer
+gitlab.com	Developer
+go.dev	Developer
+golang.org	Developer
+proxy.golang.org	Developer
+sum.golang.org	Developer
+sentry.io	Developer
+opencode.ai	Developer
+
+# Cloud / CDN / infrastructure
+cloudflare.com	Cloud / CDN
+cloudflare-dns.com	Cloud / CDN
+workers.dev	Cloud / CDN
+pages.dev	Cloud / CDN
+argotunnel.com	Cloud / CDN
+amazonaws.com	Cloud / CDN
+cloudfront.net	Cloud / CDN
+akamaiedge.net	Cloud / CDN
+akamaized.net	Cloud / CDN
+fastly.net	Cloud / CDN
+edgekey.net	Cloud / CDN
+googleapis.com	Cloud / CDN
+gstatic.com	Cloud / CDN
+googleusercontent.com	Cloud / CDN
+1e100.net	Cloud / CDN
+
+# Software / operating systems
+microsoft.com	Software
+microsoftonline.com	Software
+office.com	Software
+office365.com	Software
+live.com	Software
+windows.com	Software
+windowsupdate.com	Software
+apple.com	Software
+itunes.com	Software
+brave.com	Software
+openwrt.org	Software
+
+# Communication
+outlook.com	Communication
+skype.com	Communication
+teams.microsoft.com	Communication
+zoom.us	Communication
+slack.com	Communication
+
+# Social
+facebook.com	Social
+fbcdn.net	Social
+instagram.com	Social
+whatsapp.com	Social
+whatsapp.net	Social
+discord.com	Social
+discordapp.com	Social
+telegram.org	Social
+t.me	Social
+signal.org	Social
+linkedin.com	Social
+
+# Streaming / media
+netflix.com	Streaming
+nflxvideo.net	Streaming
+nflximg.net	Streaming
+spotify.com	Streaming
+scdn.co	Streaming
+googlevideo.com	Streaming
+ytimg.com	Streaming
+plex.tv	Streaming
+plex.direct	Streaming
+
+# IoT / home automation
+home-assistant.io	IoT
+tplinkcloud.com	IoT
+tplink.com	IoT
+
+# Infrastructure / time / IP services
+ipify.org	Infrastructure
+ipinfo.io	Infrastructure
+nist.gov	Infrastructure
+ntp.org	Infrastructure
+msftconnecttest.com	Infrastructure
+msftncsi.com	Infrastructure
+
+# Security / certificates
+godaddy.com	Security
+ssl.com	Security
+starfieldtech.com	Security
+
+# Shopping / logistics
+17track.net	Shopping
+
+# News / weather
+weather.com	News
+sky.com	News
+
+# Downloads / torrents
+knaben.org	Downloads
+
+# Analytics / tracking
+life360.com	Ads & tracking
+recombee.com	Ads & tracking

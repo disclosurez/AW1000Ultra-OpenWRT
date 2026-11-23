@@ -1,0 +1,10 @@
+#!/bin/sh
+LOG=/data/logs/dns.log
+MAX=$((20 * 1024 * 1024))
+[ -f "$LOG" ] || exit 0
+SIZE=$(wc -c < "$LOG")
+[ "$SIZE" -lt "$MAX" ] && exit 0
+mv "$LOG" "$LOG.1"
+killall -USR1 dnsmasq 2>/dev/null
+gzip -f "$LOG.1" 2>/dev/null
+ls -1t "$LOG".*.gz 2>/dev/null | tail -n +4 | xargs -r rm -f

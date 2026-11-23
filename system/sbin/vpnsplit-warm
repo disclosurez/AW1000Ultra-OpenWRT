@@ -1,0 +1,8 @@
+#!/bin/sh
+# Keep the split-tunnel ipset warm by re-resolving the configured domains
+# through local dnsmasq. The set is RAM-only and starts with just the VPN DNS
+# addresses after a reboot; without a warm query the first client lookup may
+# miss, and clients that bypass router DNS never populate it at all.
+for d in $(uci -q get vpnsplit.settings.domains); do
+	nslookup "$d" 127.0.0.1 >/dev/null 2>&1
+done

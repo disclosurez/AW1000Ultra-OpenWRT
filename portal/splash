@@ -1,0 +1,335 @@
+#!/bin/sh
+# Captive portal: splash page with the terms of use.
+#
+# Works in two modes:
+#   * plain  — opened directly (e.g. http://192.168.0.1:8088/)
+#   * UAM    — reached from a CoovaChilli/chilli-style gateway (Cudy "Manual"
+#              profile) which appends ?res=notyet&uamip=..&uamport=..&challenge=..
+#              The chilli parameters are carried through to the accept step so
+#              the portal can complete the logon handshake.
+
+CONF=captiveportal
+
+cfg() {
+	uci -q get "$CONF.main.$1" 2>/dev/null
+}
+
+esc() {
+	printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'
+}
+
+urldecode() {
+	printf '%b' "$(printf '%s' "$1" | sed 's/+/ /g; s/%/\\x/g')"
+}
+
+qs_get() {
+	local want="$1" pair
+	for pair in $(printf '%s' "${QUERY_STRING:-}" | tr '&' '\n'); do
+		case "$pair" in
+			"$want="*) printf '%s' "${pair#*=}" ;;
+		esac
+	done
+}
+
+title=$(cfg title);        [ -n "$title" ] || title="Guest Wi-Fi"
+subtitle=$(cfg subtitle);  [ -n "$subtitle" ] || subtitle="Free guest access"
+intro=$(cfg intro);        [ -n "$intro" ] || intro="Please accept the terms to get online."
+terms_file=$(cfg terms_file); [ -n "$terms_file" ] || terms_file=/etc/captiveportal.terms.txt
+minutes=$(cfg session_minutes); [ -n "$minutes" ] || minutes=240
+port=$(cfg port);          [ -n "$port" ] || port=8088
+mode=$(cfg mode);          [ -n "$mode" ] || mode=local
+
+minutes_num=$(printf '%s' "$minutes" | tr -cd '0-9')
+[ -n "$minutes_num" ] || minutes_num=240
+hours=$((minutes_num / 60))
+mins=$((minutes_num % 60))
+if [ "$hours" -gt 0 ]; then
+	if [ "$mins" -gt 0 ]; then
+		session_label="$hours h $mins min"
+	elif [ "$hours" -eq 1 ]; then
+		session_label="1 hour"
+	else
+		session_label="$hours hours"
+	fi
+else
+	if [ "$mins" -eq 1 ]; then session_label="1 minute"; else session_label="$mins minutes"; fi
+fi
+
+back=$(urldecode "$(qs_get url)")
+[ -n "$back" ] || back=$(urldecode "$(qs_get userurl)")
+case "$back" in http://*|https://*) ;; *) back="" ;; esac
+
+mac=$(urldecode "$(qs_get mac)" | tr -- '-' ':')
+case "$mac" in
+	[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]) ;;
+	*) mac="" ;;
+esac
+
+res=$(qs_get res)
+uamip=$(urldecode "$(qs_get uamip)" | tr -d ' ')
+uamport=$(urldecode "$(qs_get uamport)" | tr -d ' ')
+challenge=$(urldecode "$(qs_get challenge)" | tr -d ' ')
+client_ip=$(urldecode "$(qs_get ip)" | tr -d ' ')
+
+# Anything that is not a clean IP / port / hex challenge is dropped.
+case "$uamip" in *[!0-9.]*|"") uamip="" ;; esac
+case "$uamport" in *[!0-9]*|"") uamport="" ;; esac
+case "$challenge" in *[!0-9a-zA-Z]*|"") challenge="" ;; esac
+case "$client_ip" in *[!0-9.]*|"") client_ip="" ;; esac
+if [ -z "$uamip" ] || [ -z "$uamport" ]; then
+	uamport=""
+	challenge=""
+fi
+
+# Local mode is reached by DNAT, so the browser may be on any URL: post to the
+# portal's real address. A chilli/UAM request (Cudy "Manual" profile) is served
+# from the portal's own hostname — often HTTPS via Cloudflare — so keep the
+# action relative there. An absolute http:// URL would be mixed content on the
+# HTTPS page and is blocked pre-auth by the gateway.
+accept_url="accept"
+if [ "$mode" = "local" ] && [ -z "$uamport" ]; then
+	if [ -n "${HTTP_CF_CONNECTING_IP:-}" ] && [ -n "${HTTP_HOST:-}" ]; then
+		# Served through a public HTTPS hostname (Cloudflare tunnel): keep
+		# the POST on that origin, where the CGI is also reachable.
+		accept_url="https://$HTTP_HOST/cgi-bin/accept"
+	else
+		# The page was reached by DNAT, so the browser still shows the site
+		# the guest asked for. Ask the routing table which router address
+		# faces the client: that is the gated interface's IP, which may not
+		# be the LAN IP when the portal runs on another bridge.
+		portal_ip=""
+		client_hint="${REMOTE_ADDR:-}"
+		case "$client_hint" in *[!0-9.]*|"") client_hint="" ;; esac
+		if [ -n "$client_hint" ]; then
+			portal_ip=$(ip route get "$client_hint" 2>/dev/null \
+				| awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }')
+		fi
+		[ -n "$portal_ip" ] || portal_ip="${SERVER_ADDR:-}"
+		case "$portal_ip" in *[!0-9.]*|""|0.0.0.0) portal_ip="" ;; esac
+		[ -n "$portal_ip" ] || portal_ip=$(uci -q get network.lan.ipaddr)
+		[ -n "$portal_ip" ] || portal_ip=192.168.0.1
+		accept_url="http://$portal_ip:$port/cgi-bin/accept"
+	fi
+fi
+
+# --- who is this? -----------------------------------------------------------
+# Behind the Cloudflare tunnel REMOTE_ADDR is the local connector, so prefer
+# chilli's ip= , then the CF header, then the socket address.
+cfip="${HTTP_CF_CONNECTING_IP:-}"
+country="${HTTP_CF_IPCOUNTRY:-}"
+seen_ip="$client_ip"
+[ -n "$seen_ip" ] || seen_ip="$cfip"
+[ -n "$seen_ip" ] || seen_ip="${REMOTE_ADDR:-}"
+
+# Local mode: the guest is on this router's Wi-Fi, so the MAC is in the ARP
+# table. Use it when the gateway did not supply one.
+if [ -z "$mac" ] && [ -n "$seen_ip" ]; then
+	mac=$(awk -v ip="$seen_ip" '$1 == ip { print tolower($4); exit }' /proc/net/arp 2>/dev/null)
+	case "$mac" in
+		[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+		*) mac="" ;;
+	esac
+fi
+
+ua="${HTTP_USER_AGENT:-}"
+access_log=/tmp/portal-access.log
+printf '%s | %s | %s | %s | %s | %s\n' \
+	"$(date '+%Y-%m-%d %H:%M:%S')" "$seen_ip" "${mac:--}" "${country:--}" \
+	"$([ -n "$uamport" ] && echo uam || echo direct)" "$(printf '%s' "$ua" | tr '|' '/')" \
+	>> "$access_log" 2>/dev/null
+if [ "$(wc -l < "$access_log" 2>/dev/null || echo 0)" -gt 500 ]; then
+	tail -n 500 "$access_log" > "$access_log.tmp" && mv -f "$access_log.tmp" "$access_log"
+fi
+logger -t captive-portal "splash ip=$seen_ip mac=${mac:-unknown} uam=$([ -n "$uamport" ] && echo yes || echo no)"
+
+cat <<EOF
+Content-Type: text/html; charset=utf-8
+
+EOF
+cat <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#0e1412">
+<title>$(esc "$title") · Guest Wi-Fi</title>
+<style>
+	:root {
+		--ink: #0e1412;
+		--paper: #eef1ec;
+		--card: #ffffff;
+		--jade: #0e7a6e;
+		--jade-2: #0b6b60;
+		--mint: #57d8be;
+		--text: #1f2a25;
+		--muted: #66736d;
+		--line: #e2e6de;
+		--soft: #f7f9f5;
+	}
+	* { box-sizing: border-box; }
+	html { -webkit-text-size-adjust: 100%; }
+	body {
+		margin: 0; min-height: 100vh; background: var(--paper); color: var(--text);
+		font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+		display: flex; align-items: center; justify-content: center;
+		padding: clamp(14px, 4vw, 48px); position: relative; overflow-x: hidden;
+	}
+	body::before {
+		content: ""; position: fixed; inset: 0; pointer-events: none;
+		background:
+			radial-gradient(900px 520px at 8% -10%, rgba(87,216,190,.20), transparent 60%),
+			radial-gradient(720px 420px at 100% 0%, rgba(14,122,110,.10), transparent 55%);
+	}
+	.portal {
+		position: relative; width: 100%; max-width: 1020px;
+		display: grid; grid-template-columns: minmax(0, 380px) minmax(0, 1fr);
+		background: var(--card); border: 1px solid var(--line); border-radius: 24px;
+		box-shadow: 0 30px 80px rgba(14,20,18,.12), 0 2px 8px rgba(14,20,18,.04);
+		overflow: hidden;
+	}
+	.brand {
+		position: relative; overflow: hidden; background: var(--ink); color: #f4f5f1;
+		padding: clamp(26px, 4vw, 40px); display: flex; flex-direction: column; gap: 16px;
+	}
+	.brand::after {
+		content: ""; position: absolute; right: -120px; top: -130px;
+		width: 340px; height: 340px; border-radius: 50%;
+		background: radial-gradient(circle, rgba(87,216,190,.22), transparent 65%);
+		pointer-events: none;
+	}
+	.mark {
+		position: relative; width: 46px; height: 46px; border-radius: 14px;
+		background: linear-gradient(140deg, var(--jade), #149a88);
+		display: grid; place-items: center; color: #eafff9;
+		box-shadow: 0 8px 24px rgba(14,122,110,.35);
+	}
+	.mark svg { width: 25px; height: 25px; }
+	.eyebrow {
+		position: relative; margin: 0; font-size: 11px; font-weight: 700;
+		letter-spacing: .16em; text-transform: uppercase; color: var(--mint);
+	}
+	.brand h1 {
+		position: relative; margin: 0; font-size: clamp(26px, 3.6vw, 36px);
+		line-height: 1.12; letter-spacing: -.02em; font-weight: 650; overflow-wrap: anywhere;
+	}
+	.brand h1 span { color: var(--mint); }
+	.subtitle { position: relative; margin: -6px 0 0; color: #c9d4ce; font-size: 14px; }
+	.intro { position: relative; margin: 0; color: #b9c6bf; font-size: 14px; line-height: 1.6; }
+	.chips {
+		position: relative; list-style: none; display: flex; flex-wrap: wrap;
+		gap: 8px; padding: 0; margin: 4px 0 0;
+	}
+	.chips li {
+		font-size: 11.5px; color: #dfe9e4; border: 1px solid rgba(244,245,241,.16);
+		background: rgba(244,245,241,.06); padding: 5px 10px; border-radius: 999px;
+	}
+	.content {
+		padding: clamp(24px, 4vw, 40px); display: flex; flex-direction: column; min-width: 0;
+	}
+	.content-head h2 { margin: 0; font-size: 18px; letter-spacing: -.01em; }
+	.content-head p { margin: 4px 0 14px; color: var(--muted); font-size: 13px; }
+	.terms {
+		height: clamp(190px, 34vh, 270px); overflow: auto; overscroll-behavior: contain;
+		padding: 16px 18px; background: var(--soft); border: 1px solid var(--line);
+		border-radius: 14px; color: #37423c; font-size: 13px; line-height: 1.65;
+		scrollbar-width: thin; scrollbar-color: #c8d2cc transparent;
+	}
+	.terms p { margin: 0 0 10px; }
+	.terms p:last-child { margin-bottom: 0; }
+	.terms:focus-visible { outline: 2px solid var(--jade); outline-offset: 2px; }
+	form { margin: 18px 0 0; }
+	button {
+		width: 100%; margin-top: 14px; padding: 14px 18px; border: 0; border-radius: 12px;
+		background: var(--jade); color: #fff; font: inherit; font-size: 15px;
+		font-weight: 650; cursor: pointer; transition: background .15s ease, transform .15s ease;
+	}
+	button:hover:not(:disabled) { background: var(--jade-2); }
+	button:active:not(:disabled) { transform: translateY(1px); }
+	button:focus-visible { outline: 3px solid rgba(87,216,190,.45); outline-offset: 2px; }
+	.fine { margin: 10px 0 0; font-size: 11.5px; color: var(--muted); text-align: center; }
+	.privacy {
+		margin: 16px 0 0; padding-top: 14px; border-top: 1px solid var(--line);
+		font-size: 11px; color: #7b8781; line-height: 1.55;
+	}
+	.privacy strong { color: #4b5851; }
+	.support { margin: 8px 0 0; font-size: 11px; color: #7b8781; }
+	@media (max-width: 760px) {
+		body { align-items: flex-start; padding: 12px; }
+		.portal { grid-template-columns: 1fr; border-radius: 20px; }
+		.brand { padding: 24px 22px 22px; gap: 14px; }
+		.brand h1 { font-size: 28px; }
+		.content { padding: 22px 20px 24px; }
+		.terms { height: 210px; }
+	}
+	@media (prefers-reduced-motion: reduce) {
+		button { transition: none; }
+	}
+</style>
+</head>
+<body>
+<main class="portal">
+	<aside class="brand">
+		<div class="mark" aria-hidden="true">
+			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" focusable="false">
+				<path d="M2.5 8.5a15 15 0 0 1 19 0"/>
+				<path d="M5.8 12a10 10 0 0 1 12.4 0"/>
+				<path d="M9.1 15.4a5 5 0 0 1 5.8 0"/>
+				<circle cx="12" cy="19" r="1" fill="currentColor" stroke="none"/>
+			</svg>
+		</div>
+		<p class="eyebrow">Guest Wi-Fi</p>
+		<h1>Welcome to <span>$(esc "$title")</span></h1>
+		<p class="subtitle">$(esc "$subtitle")</p>
+		<p class="intro">$(esc "$intro")</p>
+		<ul class="chips">
+			<li>Isolated network</li>
+			<li>Up to $(esc "$session_label")</li>
+			<li>Terms required</li>
+		</ul>
+	</aside>
+	<section class="content">
+		<div class="content-head">
+			<h2>Terms of use</h2>
+			<p>Please review and accept to continue.</p>
+		</div>
+		<div class="terms" id="terms" role="region" aria-label="Terms of use" tabindex="0">
+EOF
+
+if [ -r "$terms_file" ]; then
+	# Join hard-wrapped lines into paragraphs: blank lines separate them.
+	para=""
+	while IFS= read -r line || [ -n "$line" ]; do
+		if [ -z "$line" ]; then
+			[ -n "$para" ] && printf '<p>%s</p>\n' "$(esc "$para")"
+			para=""
+		else
+			if [ -n "$para" ]; then para="$para $line"; else para="$line"; fi
+		fi
+	done < "$terms_file"
+	[ -n "$para" ] && printf '<p>%s</p>\n' "$(esc "$para")"
+else
+	printf '<p>Terms are not configured.</p>\n'
+fi
+
+cat <<EOF
+		</div>
+		<form method="post" action="$(esc "$accept_url")">
+			<input type="hidden" name="url" value="$(esc "$back")" />
+			<input type="hidden" name="mac" value="$(esc "$mac")" />
+			<input type="hidden" name="res" value="$(esc "$res")" />
+			<input type="hidden" name="uamip" value="$(esc "$uamip")" />
+			<input type="hidden" name="uamport" value="$(esc "$uamport")" />
+			<input type="hidden" name="challenge" value="$(esc "$challenge")" />
+			<input type="hidden" name="client_ip" value="$(esc "$client_ip")" />
+			<button id="accept" type="submit" name="decision" value="accept">Accept &amp; continue</button>
+			<p class="fine">By tapping <b>Accept &amp; continue</b> you agree to the terms of use. Your session lasts up to <b>$(esc "$session_label")</b>.</p>
+		</form>
+		<p class="privacy"><strong>Privacy:</strong> we record your device address and the time you accept these terms.</p>
+		<p class="support">Need help? Contact the network administrator.</p>
+	</section>
+</main>
+</body>
+</html>
+EOF

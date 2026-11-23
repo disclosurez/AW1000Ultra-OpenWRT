@@ -1,0 +1,14 @@
+# Seed for /etc/config/vpnsplit — written only if the file does not exist.
+#
+# Add domains in LuCI (Network -> VPN Split Tunnel) or here; the service
+# rewrites the dnsmasq ipset/server lists from this section on every reload.
+# NOTE: sync_config deletes dhcp.@dnsmasq[0].ipset and .server and rebuilds
+# them from this file, so do not keep hand-written entries there.
+#
+# option dns '<vpn-dns-ip>'   # resolver used for the listed domains;
+#                             # defaults to a public resolver in vpnsplit.init
+
+config vpnsplit 'settings'
+	option vpn 'wgvpn'
+	# list domains 'example.com'
+	# list ips '203.0.113.0/24'

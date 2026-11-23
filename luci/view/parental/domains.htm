@@ -1,0 +1,185 @@
+<%+header%>
+<%
+local uci = require "luci.model.uci".cursor()
+local util = require "luci.util"
+local fs = require "nixio.fs"
+local pcdata = util.pcdata
+local days_all = { "mon", "tue", "wed", "thu", "fri", "sat", "sun" }
+local days_label = { mon = "Mon", tue = "Tue", wed = "Wed", thu = "Thu", fri = "Fri", sat = "Sat", sun = "Sun" }
+
+local rules = {}
+uci:foreach("parental", "domain", function(s)
+	rules[#rules + 1] = s
+end)
+
+-- vendor lookup
+local oui = {}
+local of = io.open("/data/oui/oui.tsv", "r")
+if of then
+	for line in of:lines() do
+		local p, v = line:match("^(%x+)\t(.+)$")
+		if p then oui[p] = v end
+	end
+	of:close()
+end
+local function vendor(mac)
+	local s = mac:lower():gsub(":", "")
+	return oui[s:sub(1, 10)] or oui[s:sub(1, 9)] or oui[s:sub(1, 7)] or oui[s:sub(1, 6)] or "unknown"
+end
+
+local known, seen = {}, {}
+local lease = fs.readfile("/tmp/dhcp.leases") or ""
+local host_by_mac = {}
+for line in lease:gmatch("[^\n]+") do
+	local _, mac, ip, host = line:match("^(%S+) (%S+) (%S+) (%S+)")
+	if mac then host_by_mac[mac:lower()] = (host ~= "*") and host or "" end
+end
+local arp = fs.readfile("/proc/net/arp") or ""
+for line in arp:gmatch("[^\n]+") do
+	local ip, mac = line:match("^(%d+%.%d+%.%d+%.%d+)%s+%S+%s+%S+%s+(%S+)")
+	if ip and mac and mac ~= "00:00:00:00:00:00" then
+		local m = mac:lower()
+		if not seen[m] then
+			seen[m] = true
+			known[#known + 1] = { mac = m, ip = ip, host = host_by_mac[m] or "", vendor = vendor(m) }
+		end
+	end
+end
+table.sort(known, function(a, b)
+	local ai = tonumber(a.ip:match("%.(%d+)$")) or 0
+	local bi = tonumber(b.ip:match("%.(%d+)$")) or 0
+	if ai ~= bi then return ai < bi end
+	return a.mac < b.mac
+end)
+%>
+<h2 name="content"><%:Parental Control — Domain Blocks%></h2>
+<p class="cbi-map-descr"><%:Block domains for all devices or for one device, with optional days and time windows. Subdomains are included. Domain blocks are enforced by IP after DNS resolution, so they also stop traffic to those addresses even if a device uses another DNS server.%></p>
+
+<form method="post" action="<%=url('admin/network/parental/domains_save')%>" id="pd-form">
+<input type="hidden" name="token" value="<%=token%>" />
+<input type="hidden" name="count_dom" id="pd-count" value="<%=#rules%>" />
+
+<div class="pc-toolbar" style="margin:10px 0">
+	<button type="button" class="btn btn-primary" onclick="pdAddRow()"><%:Add domain%></button>
+</div>
+
+<div class="pc-scroll">
+<table class="cbi-section-table pc-table" style="min-width:980px">
+	<thead>
+	<tr>
+		<th style="width:36px"><%:On%></th>
+		<th><%:Domain%></th>
+		<th><%:Applies to%></th>
+		<th><%:Days%></th>
+		<th><%:From%></th>
+		<th><%:Until%></th>
+		<th style="width:44px"></th>
+	</tr>
+	</thead>
+	<tbody id="pd-body">
+	<% if #rules == 0 then %>
+	<tr id="pd-empty"><td colspan="7"><em><%:No domain rules yet.%></em></td></tr>
+	<% end %>
+	<% for i, r in ipairs(rules) do
+		local active_days = {}
+		for d in (r.days or ""):gmatch("%S+") do active_days[d] = true end
+		local tmac = (r.target or ""):match("^mac:(.+)$")
+		local in_known = false
+		for _, d in ipairs(known) do if d.mac == tmac then in_known = true end end
+	%>
+	<tr>
+		<td><input type="checkbox" name="denabled<%=i%>" value="1" data-field="denabled"<%= (r.enabled ~= "0") and " checked" or "" %> aria-label="<%:Rule enabled%>" /></td>
+		<td><input type="text" name="domain<%=i%>" value="<%=pcdata(r.domain or "")%>" data-field="domain" placeholder="youtube.com" spellcheck="false" autocapitalize="none" /></td>
+		<td>
+			<select name="target<%=i%>" data-field="target" style="max-width:300px">
+				<option value="all"<%= (r.target == "all" or not tmac) and " selected" or "" %>><%:All devices%></option>
+				<% for _, d in ipairs(known) do %>
+				<option value="mac:<%=pcdata(d.mac)%>"<%= (tmac == d.mac) and " selected" or "" %>><%=pcdata(d.ip .. " · " .. d.mac .. " · " .. d.vendor .. (d.host ~= "" and (" · " .. d.host) or ""))%></option>
+				<% end %>
+				<% if tmac and not in_known then %>
+				<option value="mac:<%=pcdata(tmac)%>" selected><%=pcdata(tmac)%></option>
+				<% end %>
+			</select>
+		</td>
+		<td class="pc-days">
+			<% for _, d in ipairs(days_all) do %>
+			<label class="pc-day"><input type="checkbox" name="dday_<%=d%><%=i%>" value="1" data-field="dday_<%=d%>"<%= active_days[d] and " checked" or "" %> /><%=days_label[d]%></label>
+			<% end %>
+		</td>
+		<td><input type="text" name="dstart<%=i%>" value="<%=pcdata(r.start or "07:00")%>" data-field="dstart" placeholder="07:00" spellcheck="false" /></td>
+		<td><input type="text" name="dend<%=i%>" value="<%=pcdata(r["end"] or "21:00")%>" data-field="dend" placeholder="21:00" spellcheck="false" /></td>
+		<td><button type="button" class="cbi-button cbi-button-remove pc-remove" onclick="pdRemoveRow(this)" aria-label="<%:Remove rule%>">×</button></td>
+	</tr>
+	<% end %>
+	</tbody>
+</table>
+</div>
+
+<div class="cbi-page-actions">
+	<button type="submit" class="cbi-button cbi-button-apply"><%:Save & Apply%></button>
+</div>
+</form>
+
+<script type="text/javascript">//<![CDATA[
+var PD_DAYS = ["mon","tue","wed","thu","fri","sat","sun"];
+var PD_LABELS = {mon:"Mon",tue:"Tue",wed:"Wed",thu:"Thu",fri:"Fri",sat:"Sat",sun:"Sun"};
+var PD_KNOWN = <%=luci.util.serialize_json(known)%>;
+
+function pdEsc(s) {
+	return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function pdRenumber() {
+	var rows = document.querySelectorAll('#pd-body tr');
+	var n = 0;
+	for (var i = 0; i < rows.length; i++) {
+		if (rows[i].id === 'pd-empty') continue;
+		n++;
+		var fields = rows[i].querySelectorAll('[data-field]');
+		for (var j = 0; j < fields.length; j++)
+			fields[j].name = fields[j].getAttribute('data-field') + n;
+	}
+	document.getElementById('pd-count').value = n;
+}
+
+function pdAddRow() {
+	var body = document.getElementById('pd-body');
+	var empty = document.getElementById('pd-empty');
+	if (empty) empty.parentNode.removeChild(empty);
+
+	var tr = document.createElement('tr');
+	var target = '<select data-field="target" style="max-width:300px"><option value="all">All devices</option>';
+	for (var k = 0; k < PD_KNOWN.length; k++) {
+		var d = PD_KNOWN[k];
+		target += '<option value="mac:' + pdEsc(d.mac) + '">' +
+			pdEsc(d.ip + ' · ' + d.mac + ' · ' + d.vendor + (d.host ? ' · ' + d.host : '')) + '</option>';
+	}
+	target += '</select>';
+
+	var days = '';
+	for (var j = 0; j < PD_DAYS.length; j++)
+		days += '<label class="pc-day"><input type="checkbox" value="1" data-field="dday_' +
+			PD_DAYS[j] + '" checked />' + PD_LABELS[PD_DAYS[j]] + '</label>';
+
+	tr.innerHTML =
+		'<td><input type="checkbox" value="1" data-field="denabled" checked /></td>' +
+		'<td><input type="text" data-field="domain" placeholder="youtube.com" spellcheck="false" autocapitalize="none" /></td>' +
+		'<td>' + target + '</td>' +
+		'<td class="pc-days">' + days + '</td>' +
+		'<td><input type="text" data-field="dstart" value="07:00" spellcheck="false" /></td>' +
+		'<td><input type="text" data-field="dend" value="21:00" spellcheck="false" /></td>' +
+		'<td><button type="button" class="cbi-button cbi-button-remove pc-remove" onclick="pdRemoveRow(this)">×</button></td>';
+	body.appendChild(tr);
+	pdRenumber();
+	tr.querySelector('input[data-field="domain"]').focus();
+}
+
+function pdRemoveRow(btn) {
+	var row = btn.closest('tr');
+	if (row) row.parentNode.removeChild(row);
+	pdRenumber();
+}
+
+document.addEventListener('DOMContentLoaded', pdRenumber);
+</script>
+<%+footer%>

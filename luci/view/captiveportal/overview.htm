@@ -1,0 +1,481 @@
+<%+header%>
+<%
+local uci  = require "luci.model.uci".cursor()
+local fs   = require "nixio.fs"
+local sys  = require "luci.sys"
+local util = require "luci.util"
+local pcdata = util.pcdata
+
+local function get(opt, default)
+	local v = uci:get("captiveportal", "main", opt)
+	if v == nil or v == "" then return default end
+	return v
+end
+
+local function count_set(name)
+	local raw = sys.exec("ipset list " .. name .. " 2>/dev/null | awk '/^Number of entries/ {print $4}'") or "0"
+	return tonumber((raw:gsub("%s+", ""))) or 0
+end
+
+local function read_dir(path)
+	local out = {}
+	local ok, d = pcall(fs.dir, path)
+	if not ok or not d then return out end
+	for name in d do
+		if name ~= "." and name ~= ".." then out[#out + 1] = name end
+	end
+	return out
+end
+
+local function bridge_members(dev)
+	local out = read_dir("/sys/class/net/" .. dev .. "/brif")
+	table.sort(out)
+	return out
+end
+
+local function is_bridge(dev)
+	return fs.stat("/sys/class/net/" .. dev .. "/bridge") ~= nil
+end
+
+local enabled  = get("enabled", "1")
+local port     = get("port", "8088")
+local title    = get("title", "Guest Wi-Fi")
+local subtitle = get("subtitle", "Free guest Wi-Fi")
+local intro    = get("intro", "")
+local minutes  = get("session_minutes", "240")
+local exempt   = get("exempt", "")
+local gate_iface = get("gate_iface", "br-lan")
+if not gate_iface:match("^[%w_][%w_%.%-:]*$") or gate_iface:find("%.%.") then
+	gate_iface = "br-lan"
+end
+local terms_fl = get("terms_file", "/etc/captiveportal.terms.txt")
+local log_file = get("log_file", "/data/portal/accept.log")
+local lan      = uci:get("network", "lan", "ipaddr") or "192.168.0.1"
+local saved    = luci.http.formvalue("saved")
+
+-- MAC vendor table (refreshed by /usr/sbin/oui-update)
+local oui = {}
+local oui_f = io.open("/data/oui/oui.tsv", "r")
+if oui_f then
+	for line in oui_f:lines() do
+		local p, v = line:match("^(%x+)\t(.+)$")
+		if p then oui[p] = v end
+	end
+	oui_f:close()
+end
+local function vendor(mac)
+	local s = (mac or ""):lower():gsub(":", "")
+	return oui[s:sub(1,10)] or oui[s:sub(1,9)] or oui[s:sub(1,7)] or oui[s:sub(1,6)] or "-"
+end
+
+local function iface_ip(dev)
+	local out = sys.exec("ip addr show dev " .. dev .. " 2>/dev/null") or ""
+	return out:match("inet%s+([%d%.]+)/")
+end
+local portal_ip = iface_ip(gate_iface) or lan
+
+-- The guest zone may not allow LuCI, but the portal listener can always be
+-- previewed from the address this LuCI page itself was opened on.
+local preview_ip = luci.http.getenv("SERVER_ADDR") or ""
+if not preview_ip:match("^%d+%.%d+%.%d+%.%d+$") or preview_ip == "0.0.0.0"
+		or preview_ip == "127.0.0.1" then
+	preview_ip = lan
+end
+
+local running = (sys.call("ps w | grep '[u]httpd' | grep -q 'www/portal'") == 0)
+local active  = count_set("portal_ok")
+
+-- ------------------------------------------------------------------ interfaces
+-- The portal gates traffic by input interface. Bridge ports and radios are
+-- not offered: once bridged, iptables matches the bridge (br-lan), not ra0.
+local devs = read_dir("/sys/class/net")
+local member_of = {}
+for _, dev in ipairs(devs) do
+	if is_bridge(dev) then
+		for _, m in ipairs(bridge_members(dev)) do member_of[m] = dev end
+	end
+end
+
+local net_of = {}
+uci:foreach("network", "interface", function(s)
+	local name = s[".name"]
+	local dev = s.device
+	if type(dev) == "table" then dev = dev[1] end
+	if not dev or dev == "" then
+		local ifname = s.ifname
+		if type(ifname) == "table" then ifname = ifname[1] end
+		dev = (ifname or ""):match("^(%S+)")
+	end
+	if fs.stat("/sys/class/net/br-" .. name) then dev = "br-" .. name end
+	if dev and dev ~= "" then net_of[dev] = name end
+end)
+
+local pretty = {
+	lan = "LAN", guest = "Guest", isp = "ISP", wan = "SIM", wan6 = "SIM6",
+	wgvpn = "VPN split tunnel", wghome = "Home WireGuard",
+}
+
+-- Interfaces that cannot be a portal boundary: loopback, kernel tunnel
+-- pseudo-devices, modem data channels, QoS ifbs and the uplink client radios.
+local hidden_ifaces = {
+	lo = true, ifb0 = true, ifb1 = true,
+	gre0 = true, gretap0 = true, erspan0 = true, sit0 = true, tunl0 = true,
+	ip6gre0 = true, ip6tnl0 = true, ip6_vti0 = true, ip_vti0 = true,
+	apcli0 = true, apclii0 = true,
+}
+
+local function usable_iface(dev)
+	return dev ~= "" and not hidden_ifaces[dev] and not dev:match("^ccmni%d+$")
+		and not member_of[dev]
+end
+
+local options, seen = {}, {}
+for _, dev in ipairs(devs) do
+	if usable_iface(dev) then
+		local net = net_of[dev]
+		local label = pretty[net or ""] or net
+		if label then
+			label = label .. " (" .. dev .. ")"
+		else
+			label = dev
+		end
+		if is_bridge(dev) then
+			local mem = bridge_members(dev)
+			if #mem > 0 then label = label .. " · " .. table.concat(mem, ", ") end
+		end
+		options[#options + 1] = { dev = dev, label = label }
+		seen[dev] = true
+	end
+end
+
+-- Keep a legacy or vanished setting visible instead of silently replacing it.
+if gate_iface ~= "" and not seen[gate_iface] then
+	local why = "not available"
+	if member_of[gate_iface] then why = "bridge member — use " .. member_of[gate_iface] end
+	table.insert(options, 1, { dev = gate_iface, label = gate_iface .. " (" .. why .. ")" })
+	seen[gate_iface] = true
+end
+
+local function rank(o)
+	if o.dev == "br-lan" then return 0 end
+	if o.dev:match("^br%-") then return 1 end
+	if net_of[o.dev] then return 2 end
+	return 3
+end
+table.sort(options, function(a, b)
+	local ra, rb = rank(a), rank(b)
+	if ra ~= rb then return ra < rb end
+	return a.dev < b.dev
+end)
+
+local function iface_label(dev)
+	local net = net_of[dev]
+	local label = pretty[net or ""] or net or dev
+	if net then label = label .. " (" .. dev .. ")" end
+	local mem = bridge_members(dev)
+	if #mem > 0 then label = label .. " — " .. table.concat(mem, ", ") end
+	return label
+end
+
+local selected_label = iface_label(gate_iface)
+local selected_member = member_of[gate_iface]
+
+local terms = ""
+if fs.access(terms_fl) then terms = fs.readfile(terms_fl) or "" end
+
+-- last acceptances / requests
+-- accept.log: ts | ip | mac | country | target | ua | vendor
+-- requests:   ts | ip | mac | country | mode | ua
+local function split_line(line)
+	local f = {}
+	for v in (line .. "|"):gmatch("([^|]*)|") do f[#f + 1] = (v:gsub("^%s+", ""):gsub("%s+$", "")) end
+	if #f >= 6 then
+		return {
+			ts = f[1], ip = f[2], mac = f[3], cc = f[4], target = f[5], ua = f[6],
+			vendor = (f[7] and f[7] ~= "") and f[7] or vendor(f[3])
+		}
+	elseif #f >= 5 then
+		return {
+			ts = f[1], ip = f[2], mac = f[3], cc = "-", target = f[4], ua = f[5],
+			vendor = vendor(f[3])
+		}
+	end
+end
+
+local function tail_lines(path, n)
+	local out = {}
+	if not fs.access(path) then return out end
+	local f = io.open(path, "r")
+	if not f then return out end
+	local lines = {}
+	for line in f:lines() do if line ~= "" then lines[#lines + 1] = line end end
+	f:close()
+	for i = math.max(1, #lines - n + 1), #lines do
+		local t = split_line(lines[i])
+		if t then out[#out + 1] = t end
+	end
+	return out
+end
+
+local accepts = tail_lines(log_file, 25)
+local requests = tail_lines("/tmp/portal-access.log", 8)
+
+local today, count = os.date("%Y-%m-%d"), 0
+if fs.access(log_file) then
+	local f = io.open(log_file, "r")
+	if f then
+		for line in f:lines() do
+			if line:sub(1, 10) == today then count = count + 1 end
+		end
+		f:close()
+	end
+end
+%>
+
+<style type="text/css">
+.cp-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+.cp-on   { background:#5cb85c; }
+.cp-off  { background:#d9534f; }
+.cp-warn { background:#f0ad4e; }
+.cp-mono { font-family:monospace; }
+.cp-url  { font-family:monospace; background:#f3f4f6; border:1px solid #ddd; border-radius:6px; padding:6px 10px; display:inline-block; }
+.cp-terms { width:100%; min-height:240px; font-family:monospace; font-size:12px; line-height:1.5; }
+.cp-alt   { color:#a94442; }
+
+.cp-adv { margin:18px 0 0; }
+.cp-adv > summary {
+	display:inline-flex; align-items:center; gap:8px; cursor:pointer;
+	padding:8px 14px; border:1px solid #cbd2d9; border-radius:6px;
+	background:#fff; font-size:13px; font-weight:600; list-style:none;
+}
+.cp-adv > summary::-webkit-details-marker { display:none; }
+.cp-adv > summary::before { content:"+"; font-family:monospace; font-size:15px; line-height:1; }
+.cp-adv[open] > summary::before { content:"−"; }
+.cp-adv-body { margin-top:12px; }
+
+.cp-activity { margin-top:22px; }
+.cp-activity > summary { cursor:pointer; font-weight:600; }
+.cp-activity > summary small { font-weight:normal; color:#777; }
+.cp-activity .cbi-section { margin-top:12px; }
+</style>
+
+<h2 name="content"><%:Captive Portal%></h2>
+
+<p class="cbi-map-descr">
+	<%:A terms page for guests. Traffic entering the router on the selected network interface is redirected to it and blocked until the visitor accepts.%>
+</p>
+
+<% if saved then %>
+<div class="alert-message success" style="margin:10px 0;padding:8px 12px;background:#dff0d8;border:1px solid #d6e9c6;border-radius:4px">
+	<%:Saved. The splash server was restarted and enforcement re-applied.%>
+</div>
+<% end %>
+
+<div class="cbi-section">
+	<h3><%:Status%></h3>
+	<div class="cbi-section-node">
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Splash server%></label>
+			<div class="cbi-value-field">
+				<% if enabled == "0" then %>
+					<span class="cp-dot cp-warn"></span><%:disabled%>
+				<% elseif running then %>
+					<span class="cp-dot cp-on"></span><%:running%>
+				<% else %>
+					<span class="cp-dot cp-off"></span><%:stopped%>
+				<% end %>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Guest portal URL%></label>
+			<div class="cbi-value-field">
+				<span class="cp-url">http://<%=pcdata(portal_ip)%>:<%=pcdata(port)%>/</span>
+				<a class="cbi-button" href="http://<%=pcdata(preview_ip)%>:<%=pcdata(port)%>/" target="_blank" rel="noopener"><%:Preview%></a>
+				<div class="cbi-value-description"><%:Guests are redirected to the interface address. Preview opens the same splash on this router's LAN address.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Gated interface%></label>
+			<div class="cbi-value-field">
+				<b><%=pcdata(selected_label)%></b>
+				<% if selected_member then %>
+					<div class="cbi-value-description cp-alt">
+						<%:This is a bridge member. iptables only sees traffic on the bridge, so this setting does not gate anything. Select%> <b><%=pcdata(selected_member)%></b> <%:instead.%>
+					</div>
+				<% else %>
+					<div class="cbi-value-description">
+						<%:Only traffic entering the router on this interface is gated. The firewall zone still decides what else a client may reach; for example, a guest zone usually allows only the portal and DNS/DHCP.%>
+					</div>
+				<% end %>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Sessions%></label>
+			<div class="cbi-value-field">
+				<b><%=active%></b> <%:active%> · <b><%=count%></b> <%:accepted today%>
+			</div>
+		</div>
+	</div>
+</div>
+
+<form method="post" action="<%=url('admin/mtk/captiveportal/save')%>" class="cbi-map">
+<input type="hidden" name="token" value="<%=token%>" />
+
+<div class="cbi-section">
+	<h3><%:Settings%></h3>
+	<div class="cbi-section-node">
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Portal enabled%></label>
+			<div class="cbi-value-field">
+				<input type="checkbox" name="enabled" value="1" <%= (enabled ~= "0") and "checked" or "" %> />
+				<div class="cbi-value-description"><%:Starts the splash server and applies the firewall rules.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Network interface%></label>
+			<div class="cbi-value-field">
+				<select class="cbi-input-select" name="gate_iface">
+				<% for _, o in ipairs(options) do %>
+					<option value="<%=pcdata(o.dev)%>"<%= (o.dev == gate_iface) and ' selected="selected"' or "" %>><%=pcdata(o.label)%></option>
+				<% end %>
+				</select>
+				<div class="cbi-value-description">
+					<%:Only traffic that enters the router on this interface is gated. A bridge is one interface; its ports and radios are listed there, not as separate choices. Selecting br-lan therefore also gates its wired ports.%>
+				</div>
+			</div>
+		</div>
+	</div>
+</div>
+
+<details class="cp-adv">
+	<summary><%:Advanced settings%></summary>
+	<div class="cp-adv-body">
+
+		<div class="cbi-section">
+			<h3><%:Page content%></h3>
+			<div class="cbi-section-node">
+				<div class="cbi-value">
+					<label class="cbi-value-title"><%:Heading%></label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text" name="title" value="<%=pcdata(title)%>" style="width:100%;max-width:420px" />
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title"><%:Subheading%></label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text" name="subtitle" value="<%=pcdata(subtitle)%>" style="width:100%;max-width:420px" />
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title"><%:Intro line%></label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text" name="intro" value="<%=pcdata(intro)%>" style="width:100%;max-width:520px" />
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title"><%:Terms of use%></label>
+					<div class="cbi-value-field">
+						<textarea class="cbi-input-text cp-terms" name="terms" spellcheck="false"><%=pcdata(terms)%></textarea>
+						<div class="cbi-value-description">
+							<%:Plain text, one paragraph per line. Stored in%> <code><%=pcdata(terms_fl)%></code><%:.%>
+						</div>
+					</div>
+				</div>
+			</div>
+		</div>
+
+		<div class="cbi-section">
+			<h3><%:Session and access%></h3>
+			<div class="cbi-section-node">
+				<div class="cbi-value">
+					<label class="cbi-value-title"><%:Listen port%></label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text" name="port" value="<%=pcdata(port)%>" style="width:110px" />
+						<div class="cbi-value-description"><%:Default 8088. Port 80 belongs to LuCI, so the portal runs alongside it.%></div>
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title"><%:Session length (minutes)%></label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text" name="session_minutes" value="<%=pcdata(minutes)%>" style="width:110px" />
+						<div class="cbi-value-description"><%:Shown on the page; also the whitelist timeout when enforcement is on.%></div>
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title"><%:Exempt devices%></label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text cp-mono" name="exempt" value="<%=pcdata(exempt)%>" placeholder="aa:bb:cc:dd:ee:ff" style="width:100%;max-width:420px" />
+						<div class="cbi-value-description"><%:Space or comma separated MACs that never see the portal, on any gated interface. Use this for your own phone or laptop.%></div>
+					</div>
+				</div>
+				<p class="cbi-map-descr" style="margin-top:14px">
+					<b><%:Isolation note:%></b>
+					<%:the portal only gates internet access until the terms are accepted; it does not isolate guests from other hosts. Use a dedicated guest bridge (such as br-guest) if guests must not reach the main LAN.%>
+				</p>
+			</div>
+		</div>
+
+	</div>
+</details>
+
+<div class="cbi-page-actions">
+	<input type="submit" class="cbi-button cbi-button-save" value="<%:Save & restart%>" />
+</div>
+</form>
+
+<details class="cp-activity">
+	<summary>
+		<%:Recent activity%>
+		<small>(<%=#accepts%> <%:recent acceptances%>, <%=#requests%> <%:splash requests%>)</small>
+	</summary>
+	<div class="cbi-section">
+		<h3><%:Recent acceptances%> <a href="<%=url('admin/logs/services/captiveportal')%>" style="font-size:12px;font-weight:normal"><%:full log%></a></h3>
+		<div class="cbi-section-node">
+		<% if #accepts == 0 then %>
+			<p><em><%:Nobody has accepted the terms yet.%></em></p>
+		<% else %>
+			<table class="cbi-section-table">
+				<thead><tr><th><%:Time%></th><th><%:IP address%></th><th><%:MAC address%></th><th><%:Vendor%></th><th><%:Country%></th><th><%:Requested page%></th></tr></thead>
+				<tbody>
+				<% for i = #accepts, 1, -1 do local a = accepts[i] %>
+					<tr>
+						<td class="cp-mono"><%=pcdata(a.ts)%></td>
+						<td class="cp-mono"><%=pcdata(a.ip or "")%></td>
+						<td class="cp-mono"><%=pcdata(a.mac or "-")%></td>
+						<td><%=pcdata(a.vendor or "-")%></td>
+						<td class="cp-mono"><%=pcdata(a.cc or "-")%></td>
+						<td class="cp-mono" style="max-width:260px;overflow:hidden;text-overflow:ellipsis"><%=pcdata(a.target or "-")%></td>
+					</tr>
+				<% end %>
+				</tbody>
+			</table>
+		<% end %>
+		</div>
+	</div>
+
+	<div class="cbi-section">
+		<h3><%:Recent splash requests%></h3>
+		<div class="cbi-section-node">
+		<% if #requests == 0 then %>
+			<p><em><%:No device has opened the splash page yet.%></em></p>
+		<% else %>
+			<table class="cbi-section-table">
+				<thead><tr><th><%:Time%></th><th><%:Client%></th><th><%:MAC%></th><th><%:Country%></th><th><%:Browser%></th></tr></thead>
+				<tbody>
+				<% for i = #requests, 1, -1 do local r = requests[i] %>
+					<tr>
+						<td class="cp-mono"><%=pcdata(r.ts)%></td>
+						<td class="cp-mono"><%=pcdata(r.ip or "")%></td>
+						<td class="cp-mono"><%=pcdata(r.mac or "-")%></td>
+						<td class="cp-mono"><%=pcdata(r.cc or "-")%></td>
+						<td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;font-size:12px"><%=pcdata(r.ua or "")%></td>
+					</tr>
+				<% end %>
+				</tbody>
+			</table>
+		<% end %>
+		</div>
+	</div>
+</details>
+
+<%+footer%>

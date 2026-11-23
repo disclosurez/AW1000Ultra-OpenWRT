@@ -1,0 +1,74 @@
+<%+header%>
+<%
+local ctrl = require "luci.controller.theme"
+local disp = require "luci.dispatcher"
+local cur_name, cur_path = ctrl.theme_current()
+local switched = luci.http.formvalue("switched")
+
+local meta = {
+	console   = { title = "AW1000 Console", descr = "The custom console theme built in this repository: graphite rail, live overview hero, WAN-interface strip, mobile drawer, IBM Plex type." },
+	bootstrap = { title = "Stock (Bootstrap)", descr = "The firmware's original LuCI theme, untouched. Every page and the original menu layout work exactly as shipped." },
+}
+%>
+
+<style type="text/css">
+.theme-cards { display:flex; gap:14px; flex-wrap:wrap; margin:16px 0 }
+.theme-card { flex:1; min-width:260px; max-width:420px }
+.theme-card form { margin:0 }
+.theme-card .cbi-section-node { height:100%; display:flex; flex-direction:column; gap:8px }
+.theme-card p { margin:0; flex:1 }
+.theme-active { border-color:#2f7d6a; box-shadow:0 0 0 1px #2f7d6a }
+</style>
+
+<h2 name="content"><%:Theme%></h2>
+
+<p class="cbi-map-descr">
+	<%:Switch the LuCI interface between the AW1000 Console theme and the stock firmware theme. The change applies immediately — no reboot, no service restart — and every setting, page and service works the same in both.%>
+</p>
+
+<% if switched then %>
+<div class="alert-message success" style="margin:10px 0;padding:8px 12px">
+	<%:Switched to%> <b><%=pcdata(meta[switched] and meta[switched].title or switched)%></b>.
+</div>
+<% end %>
+
+<div class="cbi-section">
+	<h3><%:Active theme%></h3>
+	<div class="cbi-section-node">
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Current%></label>
+			<div class="cbi-value-field"><b><%=pcdata(meta[cur_name].title)%></b> <span class="cbi-section-descr" style="display:inline">(<%=pcdata(cur_path)%>)</span></div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Roll back without the UI%></label>
+			<div class="cbi-value-field">
+				<span class="cbi-section-descr" style="display:block">
+					<%:If a theme ever breaks so badly you cannot reach this page:%>
+					<code>uci set luci.main.mediaurlbase='/luci-static/bootstrap'; uci commit luci</code>
+				</span>
+			</div>
+		</div>
+	</div>
+</div>
+
+<div class="theme-cards">
+	<% for _, name in ipairs({"console", "bootstrap"}) do local m = meta[name] %>
+	<div class="theme-card cbi-section <%= (cur_name == name) and "theme-active" or "" %>">
+		<div class="cbi-section-node">
+			<h3><%=pcdata(m.title)%></h3>
+			<% if cur_name == name then %>
+				<p><span class="cbi-section-descr"><%:Active — currently in use.%></span></p>
+			<% else %>
+				<p class="cbi-map-descr" style="margin:0"><%=pcdata(m.descr)%></p>
+				<form method="post" action="<%=url('admin/system/theme/set')%>">
+					<input type="hidden" name="token" value="<%=token%>" />
+					<input type="hidden" name="theme" value="<%=pcdata(name)%>" />
+					<input type="submit" class="cbi-button cbi-button-apply" value="<%:Switch to%> <%=pcdata(m.title)%>" />
+				</form>
+			<% end %>
+		</div>
+	</div>
+	<% end %>
+</div>
+
+<%+footer%>

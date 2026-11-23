@@ -1,0 +1,9 @@
+#!/bin/sh
+# Follow the WireGuard tunnel state: mark traffic when it comes up, fall back
+# to the WAN when it goes down.
+[ "$INTERFACE" = "wgvpn" ] || exit 0
+case "$ACTION" in
+	ifup|ifdown|ifupdate)
+		[ -x /usr/sbin/webview-vpn ] && /usr/sbin/webview-vpn apply >/dev/null 2>&1
+		;;
+esac

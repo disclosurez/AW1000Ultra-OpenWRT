@@ -1,0 +1,290 @@
+#!/bin/sh
+# Enforce MAC-based parental control rules from /etc/config/parental.
+#
+# Modes per device:
+#   ban      - always block internet access
+#   schedule - allow only during the configured days/time window(s)
+#
+# Multiple rules may share a MAC (e.g. two different windows). A device is
+# allowed if at least one schedule rule matches, and blocked if any "ban"
+# rule exists. Enforcement happens in the FORWARD chain, so blocked devices
+# keep LAN/router access but lose internet access.
+
+. /lib/functions.sh
+
+CONF=parental
+LOG=/tmp/parental.log
+STATE=/tmp/parental.state
+STATUS=/tmp/parental.status
+RULES=/tmp/parental.rules
+LOGLINES=400
+
+log_msg() {
+	local ts
+	ts=$(date '+%Y-%m-%d %H:%M:%S')
+	echo "$ts $*" >> "$LOG"
+	if [ "$(wc -l < "$LOG")" -gt "$LOGLINES" ]; then
+		tail -n "$LOGLINES" "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+	fi
+	logger -t parental "$*"
+}
+
+day_num() {
+	case "$1" in
+		mon|monday|1) echo 1 ;;
+		tue|tuesday|2) echo 2 ;;
+		wed|wednesday|3) echo 3 ;;
+		thu|thursday|4) echo 4 ;;
+		fri|friday|5) echo 5 ;;
+		sat|saturday|6) echo 6 ;;
+		sun|sunday|0|7) echo 7 ;;
+		*) echo "" ;;
+	esac
+}
+
+day_match() {
+	local cur="$1"; shift
+	local tok a b i
+	for tok in $(echo "$*" | tr ',' ' '); do
+		case "$tok" in
+			""|none) continue ;;
+			'*'|all|everyday) return 0 ;;
+			*-*)
+				a=$(day_num "${tok%%-*}")
+				b=$(day_num "${tok#*-}")
+				[ -n "$a" ] && [ -n "$b" ] || continue
+				if [ "$a" -le "$b" ]; then
+					i=$a
+					while [ "$i" -le "$b" ]; do
+						[ "$i" -eq "$cur" ] && return 0
+						i=$((i + 1))
+					done
+				else
+					i=$a
+					while [ "$i" -le 7 ]; do
+						[ "$i" -eq "$cur" ] && return 0
+						i=$((i + 1))
+					done
+					i=1
+					while [ "$i" -le "$b" ]; do
+						[ "$i" -eq "$cur" ] && return 0
+						i=$((i + 1))
+					done
+				fi
+				;;
+			*)
+				a=$(day_num "$tok")
+				[ -n "$a" ] && [ "$a" -eq "$cur" ] && return 0
+				;;
+		esac
+	done
+	return 1
+}
+
+to_min() {
+	local h=${1%%:*} m=${1#*:}
+	[ "$m" = "$1" ] && m=0
+	[ -z "$h" ] && h=0
+	[ -z "$m" ] && m=0
+	h=${h#0}; m=${m#0}
+	[ -z "$h" ] && h=0
+	[ -z "$m" ] && m=0
+	echo $((h * 60 + m))
+}
+
+window_match() {
+	local s e n
+	s=$(to_min "$1")
+	e=$(to_min "$2")
+	n=$(to_min "$3")
+	[ "$s" -eq "$e" ] && return 0
+	if [ "$s" -lt "$e" ]; then
+		[ "$n" -ge "$s" ] && [ "$n" -lt "$e" ]
+	else
+		[ "$n" -ge "$s" ] || [ "$n" -lt "$e" ]
+	fi
+}
+
+is_exempt() {
+	case " $(uci -q get parental.settings.exempt) " in
+		*" $1 "*) return 0 ;;
+	esac
+	return 1
+}
+
+collect_device() {
+	local cfg="$1" name mac enabled mode start end days
+	config_get name "$cfg" name
+	config_get mac "$cfg" mac
+	config_get_bool enabled "$cfg" enabled 1
+	config_get mode "$cfg" mode schedule
+	config_get start "$cfg" start 00:00
+	config_get end "$cfg" end 24:00
+	config_get days "$cfg" days ""
+	[ -n "$mac" ] || return 0
+	[ "$enabled" = "1" ] || return 0
+	mac=$(echo "$mac" | tr 'A-Z' 'a-z')
+	name=$(echo "$name" | tr '|' ' ')
+	# Safety: never enforce a rule against an exempt (management) device
+	is_exempt "$mac" && return 0
+	[ -n "$days" ] || days="*"
+	echo "$mac|$name|$mode|$start|$end|$days" >> "$RULES"
+}
+
+apply_rules() {
+	local now_dow now_hm
+	now_dow=$(date +%u)
+	now_hm=$(date +%H:%M)
+
+	[ -x /usr/sbin/parental-domains ] && /usr/sbin/parental-domains sync >/dev/null 2>&1
+
+	: > "$RULES"
+	config_load "$CONF"
+	config_foreach collect_device device
+
+	: > "$STATUS.new"
+	BLOCKED=""
+
+	for mac in $(cut -d'|' -f1 "$RULES" | sort -u); do
+		local name="" banned=0 sched=0 allowed_now=0
+		local mode_txt="" window_txt="" state="allowed"
+
+		while IFS='|' read -r rmac rname rmode rstart rend rdays; do
+			[ "$rmac" = "$mac" ] || continue
+			[ -n "$rname" ] && name="$rname"
+			if [ "$rmode" = "ban" ]; then
+				banned=1
+				mode_txt="always blocked"
+			else
+				sched=1
+				mode_txt="scheduled"
+				window_txt="$window_txt $rstart-$rend"
+				if day_match "$now_dow" "$rdays" && window_match "$rstart" "$rend" "$now_hm"; then
+					allowed_now=1
+				fi
+			fi
+		done < "$RULES"
+
+		[ -n "$name" ] || name="$mac"
+
+		if [ "$banned" = "1" ] || { [ "$sched" = "1" ] && [ "$allowed_now" = "0" ]; }; then
+			state="blocked"
+			BLOCKED="$BLOCKED $mac"
+		fi
+
+		echo "$mac|$name|$state|$mode_txt|$window_txt" >> "$STATUS.new"
+	done
+
+	# Log state changes only
+	[ -f "$STATE" ] || : > "$STATE"
+	while IFS='|' read -r mac name state mode_txt window_txt; do
+		old=$(grep -F "$mac|" "$STATE" 2>/dev/null | head -1)
+		if [ "$old" != "$mac|$state" ]; then
+			log_msg "$name ($mac) is now $state"
+		fi
+		echo "$mac|$state"
+	done < "$STATUS.new" > "$STATE.tmp"
+	mv "$STATE.tmp" "$STATE"
+	mv "$STATUS.new" "$STATUS"
+
+	# (Re)build the filter chain
+	iptables -N PARENTAL 2>/dev/null
+	iptables -F PARENTAL 2>/dev/null
+
+	# Management safety net: never cut SSH or plain-HTTP LuCI, even for a
+	# blocked device. This chain is also hooked into INPUT, so without these
+	# rules a banned MAC would lock itself (and us) out of the router.
+	iptables -A PARENTAL -p tcp --dport 22 -j RETURN
+	iptables -A PARENTAL -p tcp --dport 80 -j RETURN
+
+	for mac in $BLOCKED; do
+		iptables -A PARENTAL -m mac --mac-source "$mac" \
+			-m limit --limit 6/min --limit-burst 6 \
+			-j LOG --log-prefix "PTRL $mac "
+		iptables -A PARENTAL -m mac --mac-source "$mac" -j DROP
+	done
+	iptables -C FORWARD -j PARENTAL 2>/dev/null || iptables -I FORWARD 1 -j PARENTAL
+	iptables -C INPUT -j PARENTAL 2>/dev/null || iptables -I INPUT 1 -j PARENTAL
+
+	# Blocked domains (all devices)
+	if ipset list pcall 2>/dev/null | grep -q 'Number of entries: [1-9]'; then
+		iptables -A PARENTAL -m set --match-set pcall dst \
+			-m limit --limit 6/min --limit-burst 6 \
+			-j LOG --log-prefix "PTRL-DOM "
+		iptables -A PARENTAL -m set --match-set pcall dst -j DROP
+	fi
+
+	# Blocked domains for individual MACs (sets built by parental-domains)
+	for set in $(ipset list -n 2>/dev/null | grep '^pd_'); do
+		ipset list "$set" 2>/dev/null | grep -q 'Number of entries: [1-9]' || continue
+		hex=${set#pd_}
+		mac=$(echo "$hex" | sed 's/../&:/g; s/:$//')
+		iptables -A PARENTAL -m mac --mac-source "$mac" \
+			-m set --match-set "$set" dst \
+			-m limit --limit 6/min --limit-burst 6 \
+			-j LOG --log-prefix "PTRL-DOM "
+		iptables -A PARENTAL -m mac --mac-source "$mac" -m set --match-set "$set" dst -j DROP
+	done
+
+	update_acct
+
+	# Drop existing sessions for blocked devices (also breaks proxy connections)
+	for mac in $BLOCKED; do
+		ip=$(awk -F'|' -v m="$mac" '$1 == m { print $2 }' /tmp/parental.acct.map 2>/dev/null)
+		[ -n "$ip" ] && conntrack -D -s "$ip" >/dev/null 2>&1
+		[ -n "$ip" ] && conntrack -D -d "$ip" >/dev/null 2>&1
+	done
+}
+
+# Per-device byte counters. The chain is only rebuilt when a device's IP
+# changes, so counters keep accumulating between runs.
+update_acct() {
+	local mac ip
+	local newmap=/tmp/parental.acct.map.new
+
+	: > "$newmap"
+	for mac in $(cut -d'|' -f1 "$RULES" | sort -u); do
+		ip=$(awk -v m="$mac" 'tolower($2) == m { print $3; exit }' /tmp/dhcp.leases 2>/dev/null)
+		if [ -z "$ip" ]; then
+			ip=$(ip -4 neigh show dev br-lan 2>/dev/null | awk -v m="$mac" '{ if (tolower($0) ~ m) print $1 }' | head -1)
+		fi
+		[ -n "$ip" ] && echo "$mac|$ip" >> "$newmap"
+	done
+
+	iptables -N PARENTAL_ACCT 2>/dev/null
+	iptables -C FORWARD -j PARENTAL_ACCT 2>/dev/null || iptables -I FORWARD 1 -j PARENTAL_ACCT
+	iptables -C INPUT -j PARENTAL_ACCT 2>/dev/null || iptables -I INPUT 1 -j PARENTAL_ACCT
+
+	if [ -f /tmp/parental.acct.map ] && [ "$(cat "$newmap")" = "$(cat /tmp/parental.acct.map)" ]; then
+		rm -f "$newmap"
+		return
+	fi
+
+	iptables -F PARENTAL_ACCT 2>/dev/null
+	while IFS='|' read -r mac ip; do
+		iptables -A PARENTAL_ACCT -s "$ip" -j RETURN
+		iptables -A PARENTAL_ACCT -d "$ip" -j RETURN
+	done < "$newmap"
+	mv "$newmap" /tmp/parental.acct.map
+	: > /tmp/parental.acct.last
+}
+
+case "$1" in
+	apply|firewall|reload|start)
+		apply_rules
+		;;
+	clear)
+		iptables -D FORWARD -j PARENTAL 2>/dev/null
+		iptables -D INPUT -j PARENTAL 2>/dev/null
+		iptables -D FORWARD -j PARENTAL_ACCT 2>/dev/null
+		iptables -D INPUT -j PARENTAL_ACCT 2>/dev/null
+		iptables -F PARENTAL 2>/dev/null
+		iptables -X PARENTAL 2>/dev/null
+		iptables -F PARENTAL_ACCT 2>/dev/null
+		iptables -X PARENTAL_ACCT 2>/dev/null
+		;;
+	*)
+		echo "usage: $0 apply|clear"
+		exit 1
+		;;
+esac

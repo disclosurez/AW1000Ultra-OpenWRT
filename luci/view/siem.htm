@@ -1,0 +1,438 @@
+<%+header%>
+<%
+local uci  = require "luci.model.uci".cursor()
+local fs   = require "nixio.fs"
+local util = require "luci.util"
+local pcdata = util.pcdata
+
+local function get(sec, opt, default)
+	local v = uci:get("siem", sec, opt)
+	if v == nil or v == "" then return default end
+	return v
+end
+
+local enabled   = get("settings", "enabled", "0")
+local sources   = get("settings", "sources", "syslog dns")
+local interval  = get("settings", "interval", "5")
+local batch     = get("settings", "batch", "200")
+local spool     = get("settings", "spool", "/tmp/siem")
+local spool_max = get("settings", "spool_max_kb", "4096")
+local hostname  = get("settings", "hostname", "")
+local dns_file  = get("settings", "dns_file", "/data/logs/dns.log")
+local portal_file = get("settings", "portal_file", "/data/portal/accept.log")
+local backfill  = get("settings", "syslog_backfill", "0")
+
+local tenabled  = get("target", "enabled", "1")
+local transport = get("target", "transport", "syslog")
+local host      = get("target", "host", "")
+local port      = get("target", "port", "6514")
+local proto     = get("target", "proto", "tls")
+local format    = get("target", "format", "rfc5424")
+local facility  = get("target", "facility", "local0")
+local framing   = get("target", "framing", "auto")
+local tls_verify = get("target", "tls_verify", "1")
+local ca_file   = get("target", "ca_file", "")
+local target_url = get("target", "url", "")
+local http_format = get("target", "http_format", "jsonl")
+local token_file = get("target", "token_file", "/etc/siem.token")
+local auth_header = get("target", "auth_header", "Authorization")
+local auth_scheme = get("target", "auth_scheme", "")
+local extra_header = get("target", "extra_header", "")
+local insecure  = get("target", "insecure", "0")
+local drop_4xx  = get("target", "drop_on_4xx", "1")
+local timeout   = get("target", "timeout", "15")
+
+local has_tok = fs.access(token_file) and (fs.stat(token_file, "size") or 0) > 0
+local src_on = {}
+for s in (sources or ""):gmatch("%S+") do src_on[s] = true end
+local saved = luci.http.formvalue("saved")
+local status_url = url("admin/services/siem/status")
+local test_url   = url("admin/services/siem/test")
+
+local function sel(v, want)
+	return (v == want) and "selected" or ""
+end
+%>
+
+<script type="text/javascript">
+//<![CDATA[
+var siemStatusUrl = '<%=status_url%>';
+var siemTestUrl   = '<%=test_url%>';
+var siemToken     = '<%=token%>';
+
+function siemTransport() {
+	var v = document.getElementById('siem-transport').value;
+	var sys = document.querySelectorAll('.siem-only-syslog');
+	var web = document.querySelectorAll('.siem-only-http');
+	for (var i = 0; i < sys.length; i++) sys[i].style.display = (v === 'syslog') ? '' : 'none';
+	for (var j = 0; j < web.length; j++) web[j].style.display = (v === 'http') ? '' : 'none';
+}
+
+function siemBytes(n) {
+	n = Number(n || 0);
+	if (n > 1048576) return (n / 1048576).toFixed(1) + ' MB';
+	if (n > 1024) return (n / 1024).toFixed(1) + ' KB';
+	return n + ' B';
+}
+
+function siemSet(id, v) {
+	var el = document.getElementById(id);
+	if (el) el.textContent = (v === undefined || v === null || v === '') ? '—' : v;
+}
+
+function siemRender(d, log) {
+	if (!d) return;
+	/* A deliberately disabled forwarder is not a failure: keep it muted. */
+	var off = (d.enabled === '0' || d.target_enabled === '0');
+	var state = d.running ? 'running'
+		: (d.enabled === '0' ? 'Off — forwarder disabled'
+		: (d.target_enabled === '0' ? 'Off — target disabled' : 'stopped'));
+	var dot = document.getElementById('siem-dot');
+	if (dot) dot.style.background = d.running ? '#5cb85c' : (off ? '#8d9993' : '#d9534f');
+	siemSet('siem-state', state);
+	siemSet('siem-endpoint', d.endpoint);
+	siemSet('siem-sources', d.sources);
+	siemSet('siem-queue', siemBytes(d.queue_bytes) + ' · ' + (d.queue_lines || 0) + ' lines');
+	siemSet('siem-sent', d.sent);
+	siemSet('siem-dropped', d.dropped);
+	siemSet('siem-errors', d.errors);
+	siemSet('siem-last-ok', d.last_success);
+	siemSet('siem-last-error', d.last_error);
+	var l = document.getElementById('siem-log');
+	if (l && log !== undefined) l.textContent = log || 'No log entries yet.';
+}
+
+function siemPoll() {
+	if (!window.fetch) return;
+	fetch(siemStatusUrl, {
+		method: 'POST', credentials: 'same-origin',
+		headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+		body: 'token=' + encodeURIComponent(siemToken)
+	}).then(function (r) { return r.ok ? r.json() : null; })
+	  .then(function (d) { if (d) siemRender(d.status, d.log); })
+	  .catch(function () {});
+}
+
+function siemTest(btn) {
+	var out = document.getElementById('siem-test-out');
+	if (out) { out.textContent = 'Sending test event…'; out.style.color = ''; }
+	btn.disabled = true;
+	fetch(siemTestUrl, {
+		method: 'POST', credentials: 'same-origin',
+		headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+		body: 'token=' + encodeURIComponent(siemToken)
+	}).then(function (r) { return r.json(); })
+	  .then(function (d) {
+		if (out) {
+			out.textContent = d.output || (d.ok ? 'ok' : 'failed');
+			out.style.color = d.ok ? '#2f7d32' : '#b3261e';
+		}
+		siemPoll();
+	  })
+	  .catch(function (e) {
+		if (out) { out.textContent = 'request failed: ' + e; out.style.color = '#b3261e'; }
+	  })
+	  .then(function () { btn.disabled = false; });
+}
+
+if (window.fetch) { setInterval(siemPoll, 10000); setTimeout(siemPoll, 800); }
+//]]>
+</script>
+
+<style type="text/css">
+.siem-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; vertical-align:middle; background:#999; }
+.siem-log { background:#1e1e1e; color:#d0d0d0; font-size:11px; line-height:1.45; padding:10px 12px;
+            border-radius:4px; max-height:170px; overflow:auto; white-space:pre-wrap; word-break:break-all; margin:0; }
+.siem-mono { font-family:monospace; }
+.siem-test { margin-top:6px; min-height:20px; white-space:pre-wrap; font-family:monospace; font-size:12px; }
+</style>
+
+<h2 name="content"><%:SIEM Forwarding%></h2>
+
+<p class="cbi-map-descr">
+	<%:Ships this router's logs to an external SIEM or log collector. Events are spooled locally first, so a slow or unreachable collector does not block logging, and bursts survive a WAN flap. Delivery is at-least-once.%>
+</p>
+
+<% if saved then %>
+<div class="alert-message success" style="margin:10px 0;padding:8px 12px;background:#dff0d8;border:1px solid #d6e9c6;border-radius:4px">
+	<%:Settings saved and the forwarder was restarted. Use Send test event to verify the path end to end.%>
+</div>
+<% end %>
+
+<div class="cbi-section">
+	<h3><%:Status%></h3>
+	<div class="cbi-section-node">
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Service%></label>
+			<div class="cbi-value-field"><span class="siem-dot" id="siem-dot"></span><span id="siem-state">—</span></div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Endpoint%></label>
+			<div class="cbi-value-field siem-mono" id="siem-endpoint">—</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Sources%></label>
+			<div class="cbi-value-field siem-mono" id="siem-sources"><%=pcdata(sources)%></div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Queue%></label>
+			<div class="cbi-value-field siem-mono" id="siem-queue">—</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Delivered / dropped / errors%></label>
+			<div class="cbi-value-field siem-mono">
+				<span id="siem-sent">—</span> / <span id="siem-dropped">—</span> / <span id="siem-errors">—</span>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Last success%></label>
+			<div class="cbi-value-field siem-mono" id="siem-last-ok">—</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Last error%></label>
+			<div class="cbi-value-field siem-mono" id="siem-last-error" style="word-break:break-word">—</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Connection test%></label>
+			<div class="cbi-value-field">
+				<button type="button" class="cbi-button cbi-button-action" onclick="siemTest(this)"><%:Send test event%></button>
+				<div class="siem-test" id="siem-test-out"></div>
+				<div class="cbi-value-description"><%:Sends one synthetic event through the saved configuration without touching the queue. Save first if you just changed the endpoint.%></div>
+			</div>
+		</div>
+	</div>
+</div>
+
+<div class="cbi-section">
+	<h3><%:Recent forwarder log%></h3>
+	<pre class="siem-log" id="siem-log"><%
+		local out = require("luci.sys").exec("logread -e 'siem' 2>/dev/null | tail -n 12")
+		luci.http.write(pcdata((out and out:gsub("%s+$", "") ~= "") and out or translate("No log entries yet.")))
+	%></pre>
+</div>
+
+<form method="post" action="<%=url('admin/services/siem/save')%>" class="cbi-map">
+<input type="hidden" name="token" value="<%=token%>" />
+
+<div class="cbi-section">
+	<h3><%:Forwarding%></h3>
+	<div class="cbi-section-node">
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Forwarder enabled%></label>
+			<div class="cbi-value-field">
+				<input type="checkbox" name="enabled" value="1" <%= (enabled == "1") and "checked" or "" %> />
+				<div class="cbi-value-description"><%:Off keeps the service stopped and nothing leaves the router.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Target enabled%></label>
+			<div class="cbi-value-field">
+				<input type="checkbox" name="target_enabled" value="1" <%= (tenabled == "1") and "checked" or "" %> />
+				<div class="cbi-value-description"><%:A second switch for maintenance: unticking this stops delivery but keeps the settings.%></div>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Sources%></label>
+			<div class="cbi-value-field">
+				<label style="display:block;margin-bottom:4px"><input type="checkbox" name="src_syslog" value="1" <%= src_on.syslog and "checked" or "" %> /> <b>System log</b> — <span class="siem-mono">logread</span> (kernel, firewall, parental, services)</label>
+				<label style="display:block;margin-bottom:4px"><input type="checkbox" name="src_dns" value="1" <%= src_on.dns and "checked" or "" %> /> <b>DNS queries</b> — per-client names from <span class="siem-mono"><%=pcdata(dns_file)%></span></label>
+				<label style="display:block"><input type="checkbox" name="src_portal" value="1" <%= src_on.portal and "checked" or "" %> /> <b>Captive portal</b> — guest acceptances with IP, MAC, country and user agent</label>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Transport%></label>
+			<div class="cbi-value-field">
+				<select class="cbi-input-select" id="siem-transport" name="transport" onchange="siemTransport()">
+					<option value="syslog" <%=sel(transport, "syslog")%>>Syslog (RFC5424 / RFC3164)</option>
+					<option value="http" <%=sel(transport, "http")%>>HTTP / HTTPS collector</option>
+				</select>
+				<div class="cbi-value-description"><%:Syslog suits Wazuh, Graylog, rsyslog and SIEM listeners. HTTP suits Splunk HEC, Elastic webhooks and custom collectors.%></div>
+			</div>
+		</div>
+	</div>
+</div>
+
+<div class="cbi-section siem-only-syslog">
+	<h3><%:Syslog target%></h3>
+	<div class="cbi-section-node">
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Host%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="host" value="<%=pcdata(host)%>" placeholder="siem.example.com" style="width:100%;max-width:420px" />
+				<div class="cbi-value-description"><%:Hostname or IP address of the collector.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Port / protocol%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="port" value="<%=pcdata(port)%>" style="width:90px" />
+				<select class="cbi-input-select" name="proto" style="width:auto">
+					<option value="udp" <%=sel(proto, "udp")%>>UDP</option>
+					<option value="tcp" <%=sel(proto, "tcp")%>>TCP</option>
+					<option value="tls" <%=sel(proto, "tls")%>>TLS</option>
+				</select>
+				<div class="cbi-value-description">6514/TLS, 514/UDP or 601/TCP are common. TLS needs <code>openssl-util</code>.</div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Format%></label>
+			<div class="cbi-value-field">
+				<select class="cbi-input-select" name="format">
+					<option value="rfc5424" <%=sel(format, "rfc5424")%>>RFC5424</option>
+					<option value="rfc3164" <%=sel(format, "rfc3164")%>>RFC3164 (BSD)</option>
+				</select>
+				<select class="cbi-input-select" name="framing" style="width:auto">
+					<option value="auto" <%=sel(framing, "auto")%>>Framing: auto</option>
+					<option value="octet" <%=sel(framing, "octet")%>>octet-counted</option>
+					<option value="newline" <%=sel(framing, "newline")%>>newline</option>
+				</select>
+				<div class="cbi-value-description"><%:RFC5424 carries a structured-data block with the source and, for DNS queries, the client address. Auto uses octet counting on TCP/TLS.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Facility%></label>
+			<div class="cbi-value-field">
+				<select class="cbi-input-select" name="facility">
+				<% for _, f in ipairs({"local0","local1","local2","local3","local4","local5","local6","local7","daemon","user","auth","authpriv","syslog","cron"}) do %>
+					<option value="<%=f%>" <%=sel(facility, f)%>><%=f%></option>
+				<% end %>
+				</select>
+				<div class="cbi-value-description"><%:Severity is taken from the source line (user.notice, kern.warn, …); the original text is preserved in the message body.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:TLS verification%></label>
+			<div class="cbi-value-field">
+				<input type="checkbox" name="tls_verify" value="1" <%= (tls_verify == "1") and "checked" or "" %> />
+				<div class="cbi-value-description"><%:Leave on unless the collector uses a self-signed certificate.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:CA bundle%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="ca_file" value="<%=pcdata(ca_file)%>" placeholder="/etc/ssl/certs/ca-certificates.crt" style="width:100%;max-width:420px" />
+				<div class="cbi-value-description"><%:Optional extra CA file for a private PKI.%></div>
+			</div>
+		</div>
+	</div>
+</div>
+
+<div class="cbi-section siem-only-http">
+	<h3><%:HTTP collector%></h3>
+	<div class="cbi-section-node">
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:URL%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="url" value="<%=pcdata(target_url)%>" placeholder="https://siem.example.com/services/collector/event" style="width:100%;max-width:560px" />
+				<div class="cbi-value-description"><%:Splunk HEC example: https://splunk:8088/services/collector/event. Use the token field below, not a token in the URL.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Payload format%></label>
+			<div class="cbi-value-field">
+				<select class="cbi-input-select" name="http_format">
+					<option value="jsonl" <%=sel(http_format, "jsonl")%>>JSON lines (NDJSON)</option>
+					<option value="array" <%=sel(http_format, "array")%>>Single JSON object with events[]</option>
+					<option value="splunk" <%=sel(http_format, "splunk")%>>Splunk HEC envelope</option>
+					<option value="raw" <%=sel(http_format, "raw")%>>Plain text lines</option>
+				</select>
+				<div class="cbi-value-description"><%:Each event carries ts, host, source, app, pid, event and message. DNS and portal events add structured client fields.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Token%></label>
+			<div class="cbi-value-field">
+				<input type="password" class="cbi-input-text" name="api_token" value="" autocomplete="new-password"
+					placeholder="<%= has_tok and translate("unchanged — a token is already stored") or translate("paste token") %>"
+					style="width:100%;max-width:520px" />
+				<div class="cbi-value-description">
+					<%:Stored in%> <code><%=pcdata(token_file)%></code> <%:(mode 0600) and sent in a header, never in the URL or argv. Leave blank to keep it.%>
+				</div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Auth header%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="auth_header" value="<%=pcdata(auth_header)%>" style="width:180px" />
+				<input type="text" class="cbi-input-text" name="auth_scheme" value="<%=pcdata(auth_scheme)%>" placeholder="Splunk / Bearer" style="width:150px" />
+				<div class="cbi-value-description"><%:Scheme is prepended to the token. Blank sends the raw token after the header name.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Extra header%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="extra_header" value="<%=pcdata(extra_header)%>" placeholder="X-Source: aw1000" style="width:100%;max-width:420px" />
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:TLS checks%></label>
+			<div class="cbi-value-field">
+				<label style="display:block"><input type="checkbox" name="insecure" value="1" <%= (insecure == "1") and "checked" or "" %> /> <%:Skip certificate verification (self-signed collector)%></label>
+				<label style="display:block"><input type="checkbox" name="drop_on_4xx" value="1" <%= (drop_4xx == "1") and "checked" or "" %> /> <%:Drop a batch on HTTP 4xx instead of retrying forever%></label>
+			</div>
+		</div>
+	</div>
+</div>
+
+<div class="cbi-section">
+	<h3><%:Advanced%></h3>
+	<div class="cbi-section-node">
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Interval / batch%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="interval" value="<%=pcdata(interval)%>" style="width:80px" /> <%:seconds%>
+				<input type="text" class="cbi-input-text" name="batch" value="<%=pcdata(batch)%>" style="width:80px" /> <%:events per send%>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Spool%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="spool" value="<%=pcdata(spool)%>" style="width:260px" />
+				<input type="text" class="cbi-input-text" name="spool_max_kb" value="<%=pcdata(spool_max)%>" style="width:100px" /> <%:KB cap%>
+				<div class="cbi-value-description"><%:/tmp/siem is RAM and lost on reboot. Use /data/siem to persist, at the cost of eMMC writes. When full, the oldest events are dropped.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Reported hostname%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="hostname" value="<%=pcdata(hostname)%>" placeholder="router model or site name" style="width:260px" />
+				<div class="cbi-value-description"><%:Blank uses /proc/sys/kernel/hostname. Set a stable name if the router's hostname changes.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Source files%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="dns_file" value="<%=pcdata(dns_file)%>" style="width:100%;max-width:420px" />
+				<div class="cbi-value-description"><%:DNS log written by dnsmasq (dhcp.@dnsmasq[0].logfacility).%></div>
+				<input type="text" class="cbi-input-text" name="portal_file" value="<%=pcdata(portal_file)%>" style="width:100%;max-width:420px;margin-top:6px" />
+				<div class="cbi-value-description"><%:Captive-portal acceptance log.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:System log backfill%></label>
+			<div class="cbi-value-field">
+				<input type="checkbox" name="syslog_backfill" value="1" <%= (backfill == "1") and "checked" or "" %> />
+				<div class="cbi-value-description"><%:Off forwards only new lines after a restart (duplicate-free). On dumps the current 2 MB logd buffer before following; useful for a one-off catch-up but duplicates events.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Request timeout%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="timeout" value="<%=pcdata(timeout)%>" style="width:80px" /> <%:seconds%>
+			</div>
+		</div>
+	</div>
+</div>
+
+<div class="cbi-page-actions">
+	<input type="submit" class="cbi-button cbi-button-save" value="<%:Save & restart%>" />
+</div>
+</form>
+
+<script type="text/javascript">//<![CDATA[
+siemTransport();
+//]]></script>
+
+<%+footer%>

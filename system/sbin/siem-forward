@@ -1,0 +1,1304 @@
+#!/bin/sh
+# siem-forward — ship router logs to an external SIEM.
+#
+# Sources
+#   syslog   logd ring buffer (RFC3164-ish lines from logread)
+#   dns      dnsmasq query log file (/data/logs/dns.log)
+#   portal   captive-portal acceptance log (/data/portal/accept.log)
+#
+# Transports
+#   syslog   RFC5424 / RFC3164 over UDP, TCP or TLS (openssl s_client)
+#   http     HTTPS webhook / collector (Splunk HEC, Elastic, generic JSON)
+#
+# Events are spooled to disk first, then delivered by a separate flusher, so a
+# dead network or a slow SIEM does not block logging and bursts survive. The
+# spool is capped; when full, the oldest events are dropped (backpressure) and
+# the drop is counted. Delivery is at-least-once: a crash between a successful
+# send and the offset write can duplicate a batch.
+#
+# Configure in /etc/config/siem (LuCI: Services -> SIEM Forwarding).
+# Called by /etc/init.d/siem; the commands below are also useful by hand:
+#
+#   siem-forward status       key=value state + queue counters
+#   siem-forward test         send one synthetic event through the transport
+#   siem-forward flush        deliver one batch (cron / debugging)
+#
+# Environment overrides (SIEM_*) exist for testing; UCI is authoritative on the
+# device.
+
+Q_NAME=events
+TAB=$(printf '\t')
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export PATH
+# Logs contain client IP/MAC and queries; keep the spool and status root-only.
+umask 077
+
+CONFIG=siem
+HAVE_UCI=0
+command -v uci >/dev/null 2>&1 && HAVE_UCI=1
+HAVE_STAT=0
+command -v stat >/dev/null 2>&1 && HAVE_STAT=1
+HAVE_TIMEOUT=0
+command -v timeout >/dev/null 2>&1 && HAVE_TIMEOUT=1
+APPEND_COUNT=0
+
+# Nixio (shipped with LuCI) sends one UDP datagram per message without
+# BusyBox nc's wait-for-reply stall. Fall back to nc when it is unavailable.
+LUA_SENDER=${SIEM_LUA_SENDER:-/usr/lib/siem/send.lua}
+HAVE_LUA_SENDER=0
+if command -v lua >/dev/null 2>&1 && [ -r "$LUA_SENDER" ] \
+   && lua -e 'require("nixio")' >/dev/null 2>&1; then
+	HAVE_LUA_SENDER=1
+fi
+
+# ---------------------------------------------------------------- defaults
+
+ENABLED=1
+SOURCES="syslog dns"
+INTERVAL=5
+BATCH=200
+SPOOL=/tmp/siem
+SPOOL_MAX_KB=4096
+HOST_NAME=""
+DNS_FILE=/data/logs/dns.log
+PORTAL_FILE=/data/portal/accept.log
+SYSLOG_BACKFILL=0
+
+TARGET_ENABLED=1
+TARGET_NAME=main
+TRANSPORT=syslog
+HOST=""
+PORT=514
+PROTO=udp
+SYSLOG_FORMAT=rfc5424
+FACILITY=local0
+FRAMING=auto
+TLS_VERIFY=1
+CA_FILE=""
+URL=""
+HTTP_FORMAT=jsonl
+TOKEN_FILE=""
+AUTH_HEADER=Authorization
+AUTH_SCHEME=""
+EXTRA_HEADER=""
+INSECURE=0
+TIMEOUT=15
+DROP_ON_4XX=1
+
+# ---------------------------------------------------------------- config
+
+uci_get() {
+	[ "$HAVE_UCI" = 1 ] || return 1
+	uci -q get "$CONFIG.$1" 2>/dev/null
+}
+
+cfg() { # cfg <var> <uci key>
+	local _v
+	_v=$(uci_get "$2") || return 0
+	# export "VAR=value" assigns without re-parsing the value, so URLs with
+	# & ? = and headers with spaces survive intact.
+	[ -n "$_v" ] && export "$1=$_v"
+}
+
+load_config() {
+	cfg ENABLED            settings.enabled
+	cfg SOURCES            settings.sources
+	cfg INTERVAL           settings.interval
+	cfg BATCH              settings.batch
+	cfg SPOOL              settings.spool
+	cfg SPOOL_MAX_KB       settings.spool_max_kb
+	cfg HOST_NAME          settings.hostname
+	cfg DNS_FILE           settings.dns_file
+	cfg PORTAL_FILE        settings.portal_file
+	cfg SYSLOG_BACKFILL    settings.syslog_backfill
+
+	cfg TARGET_ENABLED     target.enabled
+	cfg TARGET_NAME        target.name
+	cfg TRANSPORT          target.transport
+	cfg HOST               target.host
+	cfg PORT               target.port
+	cfg PROTO              target.proto
+	cfg SYSLOG_FORMAT      target.format
+	cfg FACILITY           target.facility
+	cfg FRAMING            target.framing
+	cfg TLS_VERIFY         target.tls_verify
+	cfg CA_FILE            target.ca_file
+	cfg URL                target.url
+	cfg HTTP_FORMAT        target.http_format
+	cfg TOKEN_FILE         target.token_file
+	cfg AUTH_HEADER        target.auth_header
+	cfg AUTH_SCHEME        target.auth_scheme
+	cfg EXTRA_HEADER       target.extra_header
+	cfg INSECURE           target.insecure
+	cfg TIMEOUT            target.timeout
+	cfg DROP_ON_4XX        target.drop_on_4xx
+
+	# test hooks — never needed on the device
+	[ -n "${SIEM_ENABLED:-}" ]       && ENABLED=$SIEM_ENABLED
+	[ -n "${SIEM_SOURCES:-}" ]       && SOURCES=$SIEM_SOURCES
+	[ -n "${SIEM_INTERVAL:-}" ]      && INTERVAL=$SIEM_INTERVAL
+	[ -n "${SIEM_BATCH:-}" ]         && BATCH=$SIEM_BATCH
+	[ -n "${SIEM_SPOOL:-}" ]         && SPOOL=$SIEM_SPOOL
+	[ -n "${SIEM_SPOOL_MAX_KB:-}" ]  && SPOOL_MAX_KB=$SIEM_SPOOL_MAX_KB
+	[ -n "${SIEM_HOSTNAME:-}" ]      && HOST_NAME=$SIEM_HOSTNAME
+	[ -n "${SIEM_DNS_FILE:-}" ]      && DNS_FILE=$SIEM_DNS_FILE
+	[ -n "${SIEM_PORTAL_FILE:-}" ]   && PORTAL_FILE=$SIEM_PORTAL_FILE
+	[ -n "${SIEM_SYSLOG_BACKFILL:-}" ] && SYSLOG_BACKFILL=$SIEM_SYSLOG_BACKFILL
+	[ -n "${SIEM_TARGET_ENABLED:-}" ] && TARGET_ENABLED=$SIEM_TARGET_ENABLED
+	[ -n "${SIEM_TARGET_NAME:-}" ]   && TARGET_NAME=$SIEM_TARGET_NAME
+	[ -n "${SIEM_TRANSPORT:-}" ]     && TRANSPORT=$SIEM_TRANSPORT
+	[ -n "${SIEM_HOST:-}" ]          && HOST=$SIEM_HOST
+	[ -n "${SIEM_PORT:-}" ]          && PORT=$SIEM_PORT
+	[ -n "${SIEM_PROTO:-}" ]         && PROTO=$SIEM_PROTO
+	[ -n "${SIEM_FORMAT:-}" ]        && SYSLOG_FORMAT=$SIEM_FORMAT
+	[ -n "${SIEM_FACILITY:-}" ]      && FACILITY=$SIEM_FACILITY
+	[ -n "${SIEM_FRAMING:-}" ]       && FRAMING=$SIEM_FRAMING
+	[ -n "${SIEM_TLS_VERIFY:-}" ]    && TLS_VERIFY=$SIEM_TLS_VERIFY
+	[ -n "${SIEM_CA_FILE:-}" ]       && CA_FILE=$SIEM_CA_FILE
+	[ -n "${SIEM_URL:-}" ]           && URL=$SIEM_URL
+	[ -n "${SIEM_HTTP_FORMAT:-}" ]   && HTTP_FORMAT=$SIEM_HTTP_FORMAT
+	[ -n "${SIEM_TOKEN_FILE:-}" ]    && TOKEN_FILE=$SIEM_TOKEN_FILE
+	[ -n "${SIEM_AUTH_HEADER:-}" ]   && AUTH_HEADER=$SIEM_AUTH_HEADER
+	[ -n "${SIEM_AUTH_SCHEME:-}" ]   && AUTH_SCHEME=$SIEM_AUTH_SCHEME
+	[ -n "${SIEM_EXTRA_HEADER:-}" ]  && EXTRA_HEADER=$SIEM_EXTRA_HEADER
+	[ -n "${SIEM_INSECURE:-}" ]      && INSECURE=$SIEM_INSECURE
+	[ -n "${SIEM_TIMEOUT:-}" ]       && TIMEOUT=$SIEM_TIMEOUT
+	[ -n "${SIEM_DROP_ON_4XX:-}" ]   && DROP_ON_4XX=$SIEM_DROP_ON_4XX
+
+	[ -n "$HOST_NAME" ] || HOST_NAME=$(cat /proc/sys/kernel/hostname 2>/dev/null)
+	[ -n "$HOST_NAME" ] || HOST_NAME=$(uname -n 2>/dev/null)
+	[ -n "$HOST_NAME" ] || HOST_NAME=router
+	HOST_NAME=$(printf '%s' "$HOST_NAME" | tr -c 'A-Za-z0-9._-' '-')
+
+	# A leading dash would be read as an option by nc/openssl.
+	case "$HOST" in -*|*' '*) log "invalid target host '$HOST'"; HOST="" ;; esac
+
+	# Header names end up in a curl config file; keep them to token chars and
+	# strip CR/LF from free-form headers (config injection).
+	AUTH_HEADER=$(printf '%s' "$AUTH_HEADER" | tr -cd 'A-Za-z0-9-')
+	[ -n "$AUTH_HEADER" ] || AUTH_HEADER=Authorization
+	# auth_scheme lands in the same config file: no CR/LF, no directives.
+	AUTH_SCHEME=$(printf '%s' "$AUTH_SCHEME" | tr -d '\r\n' | tr -cd 'A-Za-z0-9._ -' | cut -c1-32)
+	EXTRA_HEADER=$(printf '%s' "$EXTRA_HEADER" | tr -d '\r\n')
+	URL=$(printf '%s' "$URL" | tr -d '\r\n')
+
+	# The spool is chmod 700'd and written to; refuse to point it at /etc.
+	case "$SPOOL" in
+		/tmp/*|/data/*) ;;
+		*) log "unsafe spool '$SPOOL'; using /tmp/siem"; SPOOL=/tmp/siem ;;
+	esac
+
+	ACTIVE=0
+	[ "$ENABLED" = 1 ] && [ "$TARGET_ENABLED" = 1 ] && ACTIVE=1
+
+	case "$TRANSPORT" in syslog|http) ;; *) ACTIVE=0 ;; esac
+	# A target without an endpoint is not useful: stay idle rather than
+	# filling the spool with events that can never be delivered.
+	[ "$TRANSPORT" = syslog ] && [ -z "$HOST" ] && ACTIVE=0
+	[ "$TRANSPORT" = http ] && [ -z "$URL" ] && ACTIVE=0
+	case "$PROTO" in udp|tcp|tls) ;; *) PROTO=tcp ;; esac
+	case "$SYSLOG_FORMAT" in rfc5424|rfc3164) ;; *) SYSLOG_FORMAT=rfc5424 ;; esac
+	case "$HTTP_FORMAT" in jsonl|array|splunk|raw) ;; *) HTTP_FORMAT=jsonl ;; esac
+	case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5 ;; esac
+	case "$BATCH" in ''|*[!0-9]*|0) BATCH=200 ;; esac
+	case "$SPOOL_MAX_KB" in ''|*[!0-9]*) SPOOL_MAX_KB=4096 ;; esac
+	case "$PORT" in ''|*[!0-9]*) PORT=514 ;; esac
+	case "$TIMEOUT" in ''|*[!0-9]*) TIMEOUT=15 ;; esac
+	[ "$INTERVAL" -lt 1 ] && INTERVAL=1
+	[ "$INTERVAL" -gt 300 ] && INTERVAL=300
+	[ "$BATCH" -gt 1000 ] && BATCH=1000
+	[ "$PORT" -lt 1 ] && PORT=514
+	[ "$PORT" -gt 65535 ] && PORT=65535
+	[ "$TIMEOUT" -lt 2 ] && TIMEOUT=2
+	[ "$TIMEOUT" -gt 120 ] && TIMEOUT=120
+	MAX_BYTES=$((SPOOL_MAX_KB * 1024))
+}
+
+endpoint() {
+	case "$TRANSPORT" in
+		http)
+			if [ -z "$URL" ]; then
+				printf 'unset'
+			else
+				printf '%s' "$URL" \
+					| sed -e 's#^\(https*://\)[^/@]*@#\1***@#' \
+					      -e 's#\([?&]token=\)[^&]*#\1***#g' \
+					      -e 's#\([?&]key=\)[^&]*#\1***#g' \
+					      -e 's#\([?&]apikey=\)[^&]*#\1***#g' \
+					      -e 's#\([?&]api_key=\)[^&]*#\1***#g' \
+					      -e 's#\([?&]secret=\)[^&]*#\1***#g'
+			fi
+			;;
+		*)
+			if [ -z "$HOST" ]; then
+				printf 'unset'
+			else
+				printf '%s:%s/%s' "$HOST" "$PORT" "$PROTO"
+			fi
+			;;
+	esac
+}
+
+# ---------------------------------------------------------------- plumbing
+
+log() { # local syslog only; the syslog collector drops tag "siem"
+	command -v logger >/dev/null 2>&1 && logger -t siem "$*" 2>/dev/null
+	[ "${SIEM_DEBUG:-0}" = 1 ] && printf '%s\n' "$*" >&2
+	return 0
+}
+
+# Bound a blocking connect/send by target.timeout (BusyBox timeout is present
+# on this image; if it is not, run without the wrapper).
+run_timeout() {
+	if [ "$HAVE_TIMEOUT" = 1 ]; then
+		timeout "$TIMEOUT" "$@"
+	else
+		"$@"
+	fi
+}
+
+now() { date +%s 2>/dev/null || echo 0; }
+
+iso_now() { date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null; }
+
+epoch_iso() {
+	date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null && return 0
+	iso_now
+}
+
+epoch_stamp() {
+	date -u -d "@$1" '+%b %e %H:%M:%S' 2>/dev/null && return 0
+	date -u '+%b %e %H:%M:%S' 2>/dev/null
+}
+
+file_size() {
+	if [ -f "$1" ]; then
+		if [ "$HAVE_STAT" = 1 ]; then
+			stat -c %s "$1" 2>/dev/null
+		else
+			wc -c < "$1" 2>/dev/null
+		fi
+	else
+		echo 0
+	fi
+}
+
+file_lines() {
+	if [ -f "$1" ]; then wc -l < "$1" 2>/dev/null; else echo 0; fi
+}
+
+file_inode() {
+	if [ "$HAVE_STAT" = 1 ]; then
+		stat -c %i "$1" 2>/dev/null
+	else
+		ls -i "$1" 2>/dev/null | awk '{print $1}'
+	fi
+}
+
+read_num() { # read_num <file> <default>
+	local v
+	v=$(cat "$1" 2>/dev/null)
+	case "$v" in ''|*[!0-9]*) echo "$2" ;; *) echo "$v" ;; esac
+}
+
+ensure_spool() {
+	mkdir -p "$SPOOL" 2>/dev/null || return 1
+	Q="$SPOOL/$Q_NAME"
+	LOCK="$SPOOL/.lock"
+	[ -f "$Q" ] || : > "$Q"
+	[ -f "$SPOOL/off" ]    || echo 0 > "$SPOOL/off"
+	[ -f "$SPOOL/gen" ]    || echo 0 > "$SPOOL/gen"
+	[ -f "$SPOOL/sent" ]   || echo 0 > "$SPOOL/sent"
+	[ -f "$SPOOL/errors" ] || echo 0 > "$SPOOL/errors"
+	[ -f "$SPOOL/dropped" ] || echo 0 > "$SPOOL/dropped"
+	chmod 700 "$SPOOL" 2>/dev/null
+	chmod 600 "$Q" "$SPOOL/off" "$SPOOL/gen" "$SPOOL/sent" \
+		"$SPOOL/errors" "$SPOOL/dropped" 2>/dev/null
+	return 0
+}
+
+acquire_lock() {
+	local i=0 pid
+	while :; do
+		if mkdir "$LOCK" 2>/dev/null; then
+			echo $$ > "$LOCK/pid" 2>/dev/null
+			return 0
+		fi
+		pid=$(cat "$LOCK/pid" 2>/dev/null)
+		if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+			rm -rf "$LOCK" 2>/dev/null
+			continue
+		fi
+		i=$((i + 1))
+		[ "$i" -gt 20 ] && return 1
+		sleep 0.1 2>/dev/null || sleep 1
+	done
+}
+
+release_lock() { rm -rf "$LOCK" 2>/dev/null; }
+
+json_escape() {
+	sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' -e 's/\r/\\r/g' \
+		| tr -d '\000-\010\013\014\016-\037'
+}
+
+sd_escape() {
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\]/\\]/g'
+}
+
+# ---------------------------------------------------------------- parsing
+
+APP=""; PID=""; EVENT=""; CLIENT=""; QNAME=""; QTYPE=""
+CLIENT_MAC=""; COUNTRY=""; URL_ORIGIN=""; USER_AGENT=""
+SEVERITY=6; SEVERITY_NAME=info
+
+parse_syslog_line() {
+	local rest tok i
+
+	APP=""; PID=""
+	rest=$(printf '%s' "$1" | sed -e \
+		's/^[A-Z][a-z][a-z] [A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] [0-9][0-9][0-9][0-9] //' -e \
+		's/^[A-Z][a-z][a-z] [A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] //' -e \
+		's/^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] [0-9][0-9][0-9][0-9] //' -e \
+		's/^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] //')
+
+	# Walk past an optional "<facility>.<severity>" and an optional hostname
+	# until the "app[pid]:" token. Local logread lines carry the priority
+	# and no hostname; remote or syslog-ng lines carry a hostname.
+	i=0
+	while [ "$i" -lt 4 ]; do
+		tok=${rest%% *}
+		case "$tok" in
+			*:*|*'['*) break ;;
+			'') break ;;
+			*.*)
+				# "<facility>.<severity>" — keep severity for the SIEM
+				case "${tok#*.}" in
+					emerg|panic) SEVERITY=0; SEVERITY_NAME=emerg ;;
+					alert)       SEVERITY=1; SEVERITY_NAME=alert ;;
+					crit)        SEVERITY=2; SEVERITY_NAME=crit ;;
+					err|error)   SEVERITY=3; SEVERITY_NAME=err ;;
+					warn|warning) SEVERITY=4; SEVERITY_NAME=warning ;;
+					notice)      SEVERITY=5; SEVERITY_NAME=notice ;;
+					debug)       SEVERITY=7; SEVERITY_NAME=debug ;;
+					*)           SEVERITY=6; SEVERITY_NAME=info ;;
+				esac
+				;;
+		esac
+		rest=${rest#* }
+		i=$((i + 1))
+	done
+	[ "$rest" = "$tok" ] && rest=""
+	case "$tok" in *:*|*'['*) ;; *) tok="" ;; esac
+
+	if [ -n "$tok" ] && [ "$rest" != "" ]; then
+		APP=${tok%%:*}
+		case "$APP" in
+			*'['*) PID=${APP#*[}; PID=${PID%]*}; APP=${APP%%[*} ;;
+		esac
+		case "$PID" in ''|*[!0-9]*) PID="" ;; esac
+	fi
+}
+
+parse_dns_line() {
+	local body
+
+	APP=dnsmasq; PID=""; EVENT=""; CLIENT=""; QNAME=""; QTYPE=""
+	body=${1#*]: }
+	[ "$body" = "$1" ] && body=$1
+	case "$body" in
+		query'['*)
+			QTYPE=${body#query[}; QTYPE=${QTYPE%%]*}
+			body=${body#*] }
+			QNAME=${body%% from *}
+			CLIENT=${body##* from }
+			CLIENT=${CLIENT%%#*}     # dnsmasq may append "#port"
+			case "$CLIENT" in *[!0-9.]*) CLIENT="" ;; esac
+			EVENT=dns_query
+			;;
+		*' is '*|*' cached '*|*' forwarded '*|*' reply '*)
+			EVENT=dns_answer
+			;;
+		*) EVENT=dns ;;
+	esac
+}
+
+parse_portal_line() {
+	local rest
+
+	APP=captive-portal; PID=""; EVENT=portal_accept
+	CLIENT=""; CLIENT_MAC=""; COUNTRY=""; URL_ORIGIN=""; USER_AGENT=""
+
+	rest=$1
+	rest=${rest#* | }; CLIENT=${rest%% | *}
+	rest=${rest#* | }; CLIENT_MAC=${rest%% | *}
+	rest=${rest#* | }; COUNTRY=${rest%% | *}
+	rest=${rest#* | }; URL_ORIGIN=${rest%% | *}
+	USER_AGENT=${rest#* | }
+	[ "$USER_AGENT" = "$rest" ] && USER_AGENT=""
+
+	case "$CLIENT" in *[!0-9.]*) CLIENT="" ;; esac
+	case "$CLIENT_MAC" in *[!0-9A-Fa-f:-]*) CLIENT_MAC="" ;; esac
+}
+
+parse_event() { # parse_event <source> <raw>
+	APP=""; PID=""; EVENT=""; CLIENT=""; QNAME=""; QTYPE=""
+	CLIENT_MAC=""; COUNTRY=""; URL_ORIGIN=""; USER_AGENT=""
+	SEVERITY=6; SEVERITY_NAME=info
+	case "$1" in
+		syslog) parse_syslog_line "$2" ;;
+		dns)    parse_dns_line "$2" ;;
+		portal) parse_portal_line "$2" ;;
+		*)      APP=$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-') ;;
+	esac
+	[ -n "$APP" ] || APP=$1
+	[ -n "$EVENT" ] || EVENT=$1
+	APP=$(printf '%s' "$APP" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-48)
+	case "$PID" in ''|*[!0-9]*) PID="-" ;; esac
+}
+
+json_event() { # json_event <source> <epoch> <raw>
+	local extra="" src esc_host esc_src esc_app esc_event esc_msg
+
+	src=$1
+	parse_event "$src" "$3"
+	esc_host=$(printf '%s' "$HOST_NAME" | json_escape)
+	esc_src=$(printf '%s' "$src" | json_escape)
+	esc_app=$(printf '%s' "$APP" | json_escape)
+	esc_event=$(printf '%s' "$EVENT" | json_escape)
+	esc_msg=$(printf '%s' "$3" | json_escape)
+
+	extra=""
+	case "$src" in
+		dns)
+			[ -n "$CLIENT" ] && extra="$extra,\"client_ip\":\"$(printf '%s' "$CLIENT" | json_escape)\""
+			[ -n "$QNAME" ]  && extra="$extra,\"query\":\"$(printf '%s' "$QNAME" | json_escape)\""
+			[ -n "$QTYPE" ]  && extra="$extra,\"qtype\":\"$(printf '%s' "$QTYPE" | json_escape)\""
+			;;
+		portal)
+			[ -n "$CLIENT" ]     && extra="$extra,\"client_ip\":\"$(printf '%s' "$CLIENT" | json_escape)\""
+			[ -n "$CLIENT_MAC" ] && extra="$extra,\"client_mac\":\"$(printf '%s' "$CLIENT_MAC" | json_escape)\""
+			[ -n "$COUNTRY" ]    && extra="$extra,\"country\":\"$(printf '%s' "$COUNTRY" | json_escape)\""
+			[ -n "$URL_ORIGIN" ] && extra="$extra,\"url\":\"$(printf '%s' "$URL_ORIGIN" | json_escape)\""
+			[ -n "$USER_AGENT" ] && extra="$extra,\"user_agent\":\"$(printf '%s' "$USER_AGENT" | json_escape)\""
+			;;
+	esac
+
+	printf '{"ts":"%s","epoch":%s,"host":"%s","source":"%s","app":"%s","pid":"%s","severity":"%s","severity_num":%s,"event":"%s"%s,"message":"%s"}' \
+		"$(epoch_iso "$2")" "$2" "$esc_host" "$esc_src" "$esc_app" \
+		"${PID:--}" "$SEVERITY_NAME" "$SEVERITY" "$esc_event" "$extra" "$esc_msg"
+}
+
+facility_code() {
+	case "$FACILITY" in
+		kern) echo 0 ;; user) echo 1 ;; mail) echo 2 ;; daemon) echo 3 ;;
+		auth) echo 4 ;; syslog) echo 5 ;; lpr) echo 6 ;; news) echo 7 ;;
+		uucp) echo 8 ;; cron) echo 9 ;; authpriv) echo 10 ;; ftp) echo 11 ;;
+		local[0-7]) echo $((16 + ${FACILITY#local})) ;;
+		*) echo 16 ;;
+	esac
+}
+
+rfc5424_message() { # rfc5424_message <source> <epoch> <raw>
+	local pri sd
+
+	parse_event "$1" "$3"
+	pri=$(( $(facility_code) * 8 + SEVERITY ))
+
+	sd="[aw1000@32473 source=\"$(sd_escape "$1")\" event=\"$(sd_escape "$EVENT")\""
+	[ -n "$CLIENT" ] && sd="$sd client=\"$(sd_escape "$CLIENT")\""
+	sd="$sd]"
+
+	printf '<%d>1 %s %s %s %s %s %s %s' \
+		"$pri" "$(epoch_iso "$2")" "$HOST_NAME" "$APP" "$PID" \
+		"$(printf '%s' "$EVENT" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-32)" \
+		"$sd" "$3"
+}
+
+rfc3164_message() { # rfc3164_message <source> <epoch> <raw>
+	local pri
+
+	parse_event "$1" "$3"
+	pri=$(( $(facility_code) * 8 + SEVERITY ))
+	if [ "$PID" = "-" ]; then
+		printf '<%d>%s %s %s: %s' "$pri" "$(epoch_stamp "$2")" "$HOST_NAME" "$APP" "$3"
+	else
+		printf '<%d>%s %s %s[%s]: %s' "$pri" "$(epoch_stamp "$2")" "$HOST_NAME" "$APP" "$PID" "$3"
+	fi
+}
+
+# ---------------------------------------------------------------- spool
+
+append_line() { # append_line <source> <raw>
+	local src raw epoch
+
+	src=$1
+	raw=$(printf '%s' "$2" | tr -d '\r' | sed 's/\t/ /g')
+	[ -n "$raw" ] || return 0
+
+	acquire_lock || { log "spool lock busy; dropped one $src event"; return 1; }
+	epoch=$(now)
+	printf '%s\t%s\t%s\n' "$src" "$epoch" "$raw" >> "$Q"
+	release_lock || true
+
+	# Checking the file size on every line is wasteful on a busy DNS log;
+	# ten lines of slack is far below the 4 MB cap.
+	APPEND_COUNT=$((APPEND_COUNT + 1))
+	[ $((APPEND_COUNT % 10)) -eq 0 ] && compact_spool
+	return 0
+}
+
+compact_spool() {
+	local size lines keep dropped total rounds cur
+
+	[ "$MAX_BYTES" -gt 0 ] || return 0
+	size=$(file_size "$Q")
+	[ "$size" -gt "$MAX_BYTES" ] || return 0
+
+	acquire_lock || return 0
+	size=$(file_size "$Q")
+	total=0; rounds=0
+	while [ "$size" -gt "$MAX_BYTES" ] && [ "$rounds" -lt 12 ]; do
+		lines=$(file_lines "$Q")
+		[ "$lines" -le 1 ] && break
+		keep=$((lines / 2))
+		[ "$keep" -lt 1 ] && keep=1
+		dropped=$((lines - keep))
+		tail -n "$keep" "$Q" > "$SPOOL/.compact.$$" 2>/dev/null && \
+			mv -f "$SPOOL/.compact.$$" "$Q"
+		total=$((total + dropped))
+		size=$(file_size "$Q")
+		rounds=$((rounds + 1))
+	done
+	if [ "$total" -gt 0 ]; then
+		# offsets are byte based, and the file was rewritten: start over
+		echo 0 > "$SPOOL/off"
+		cur=$(read_num "$SPOOL/gen" 0)
+		echo $((cur + 1)) > "$SPOOL/gen"
+		cur=$(read_num "$SPOOL/dropped" 0)
+		echo $((cur + total)) > "$SPOOL/dropped"
+		log "spool over ${SPOOL_MAX_KB} KB; dropped oldest $total events"
+	fi
+	release_lock || true
+}
+
+set_error() {
+	LAST_ERROR=$(printf '%s' "$*" | tr '\n\t' '  ' | cut -c1-400)
+	echo "$LAST_ERROR" > "$SPOOL/last-error" 2>/dev/null
+	ERRORS=$((ERRORS + 1))
+	echo "$ERRORS" > "$SPOOL/errors" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- transports
+
+syslog_message() { # syslog_message <source> <epoch> <raw>
+	if [ "$SYSLOG_FORMAT" = rfc3164 ]; then
+		rfc3164_message "$1" "$2" "$3"
+	else
+		rfc5424_message "$1" "$2" "$3"
+	fi
+}
+
+build_wire() { # build_wire <batch-tsv> <out> <octet|newline>
+	local in out framing src epoch raw msg len
+	in=$1; out=$2; framing=$3
+	: > "$out"
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		src=${line%%"$TAB"*}; line=${line#*"$TAB"}
+		epoch=${line%%"$TAB"*}; raw=${line#*"$TAB"}
+		msg=$(syslog_message "$src" "$epoch" "$raw")
+		if [ "$framing" = octet ]; then
+			len=$(printf '%s' "$msg" | wc -c)
+			printf '%d %s' "$len" "$msg" >> "$out"
+		else
+			printf '%s\n' "$msg" >> "$out"
+		fi
+	done < "$in"
+}
+
+send_syslog_udp() {
+	local in src epoch raw msg mbytes chunk chunk_bytes rc err wire
+
+	in=$1
+
+	if [ "$HAVE_LUA_SENDER" = 1 ]; then
+		err="$SPOOL/.lua.$$"
+		wire="$SPOOL/.wire.$$"
+		build_wire "$in" "$wire" newline || { rm -f "$wire" "$err"; return 1; }
+		if run_timeout lua "$LUA_SENDER" udp "$HOST" "$PORT" "$wire" "$TIMEOUT" 2>"$err"; then
+			rm -f "$wire" "$err"
+			return 0
+		fi
+		set_error "udp send to $HOST:$PORT failed: $(head -n 1 "$err" 2>/dev/null)"
+		rm -f "$wire" "$err"
+		return 1
+	fi
+
+	chunk=""; chunk_bytes=0
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		src=${line%%"$TAB"*}; line=${line#*"$TAB"}
+		epoch=${line%%"$TAB"*}; raw=${line#*"$TAB"}
+		msg=$(syslog_message "$src" "$epoch" "$raw")
+		mbytes=$(printf '%s\n' "$msg" | wc -c)
+		if [ $((chunk_bytes + mbytes)) -gt 1200 ] && [ "$chunk_bytes" -gt 0 ]; then
+			printf '%s' "$chunk" | nc -u -w 1 "$HOST" "$PORT" || {
+				set_error "udp send to $HOST:$PORT failed"
+				return 1
+			}
+			chunk=""; chunk_bytes=0
+		fi
+		chunk="$chunk$msg
+"
+		chunk_bytes=$((chunk_bytes + mbytes))
+	done < "$in"
+	if [ "$chunk_bytes" -gt 0 ]; then
+		printf '%s' "$chunk" | nc -u -w 1 "$HOST" "$PORT" || {
+			set_error "udp send to $HOST:$PORT failed"
+			return 1
+		}
+	fi
+	return 0
+}
+
+send_syslog_stream() {
+	local in framing wire rc err
+
+	in=$1
+	framing=$FRAMING
+	[ "$framing" = auto ] && framing=octet
+
+	wire="$SPOOL/.wire.$$"
+	build_wire "$in" "$wire" "$framing" || { rm -f "$wire"; return 1; }
+
+	if [ "$PROTO" = tls ]; then
+		command -v openssl >/dev/null 2>&1 || {
+			set_error "openssl missing; TLS syslog unavailable"
+			rm -f "$wire"; return 1
+		}
+		if [ "$TLS_VERIFY" = 1 ]; then
+			set -- -quiet -no_ign_eof -verify_return_error
+			[ -n "$CA_FILE" ] && set -- "$@" -CAfile "$CA_FILE"
+			# -verify_return_error checks the chain only; bind the certificate
+			# to the configured host as well (OpenSSL 1.1.1 supports both).
+			case "$HOST" in
+				\[*\])     set -- "$@" -verify_ip "$(printf '%s' "$HOST" | tr -d '[]')" ;;
+				*:* )      set -- "$@" -verify_ip "$(printf '%s' "$HOST" | tr -d '[]')" ;;
+				*[!0-9.]*) set -- "$@" -verify_hostname "$HOST" ;;
+				* )        set -- "$@" -verify_ip "$HOST" ;;
+			esac
+		else
+			set -- -quiet -no_ign_eof
+		fi
+		cat "$wire" | run_timeout openssl s_client "$@" -connect "$HOST:$PORT" -servername "$HOST" \
+			>/dev/null 2>"$SPOOL/.tls.$$"
+		rc=$?
+		if [ "$rc" -ne 0 ]; then
+			set_error "tls send failed (rc=$rc): $(head -n 1 "$SPOOL/.tls.$$" 2>/dev/null)"
+			rm -f "$wire" "$SPOOL/.tls.$$"
+			return 1
+		fi
+		rm -f "$SPOOL/.tls.$$"
+	elif [ "$HAVE_LUA_SENDER" = 1 ]; then
+		err="$SPOOL/.lua.$$"
+		run_timeout lua "$LUA_SENDER" tcp "$HOST" "$PORT" "$wire" "$TIMEOUT" 2>"$err"
+		rc=$?
+		if [ "$rc" -ne 0 ]; then
+			set_error "tcp send to $HOST:$PORT failed: $(head -n 1 "$err" 2>/dev/null)"
+			rm -f "$wire" "$err"
+			return 1
+		fi
+		rm -f "$err"
+	else
+		cat "$wire" | nc -w "$TIMEOUT" "$HOST" "$PORT"
+		rc=$?
+		if [ "$rc" -ne 0 ]; then
+			set_error "tcp send to $HOST:$PORT failed (rc=$rc)"
+			rm -f "$wire"
+			return 1
+		fi
+	fi
+	rm -f "$wire"
+	return 0
+}
+
+send_syslog() {
+	if [ "$PROTO" = tls ]; then
+		command -v openssl >/dev/null 2>&1 || {
+			set_error "openssl missing; install openssl-util for TLS syslog"
+			return 1
+		}
+	elif [ "$HAVE_LUA_SENDER" = 0 ]; then
+		command -v nc >/dev/null 2>&1 || {
+			set_error "neither lua/nixio nor nc is available; cannot send syslog"
+			return 1
+		}
+	fi
+	case "$PROTO" in
+		udp) send_syslog_udp "$1" ;;
+		tcp|tls) send_syslog_stream "$1" ;;
+		*) set_error "unsupported syslog proto '$PROTO'"; return 1 ;;
+	esac
+}
+
+build_http_payload() { # build_http_payload <batch-tsv> <out> <content-type-file>
+	local in out ctype src epoch raw ev first
+
+	in=$1; out=$2; ctype=$3
+	first=1
+	: > "$out"
+
+	case "$HTTP_FORMAT" in
+		raw)
+			echo 'text/plain' > "$ctype"
+			while IFS= read -r line; do
+				[ -n "$line" ] || continue
+				line=${line#*"$TAB"}; line=${line#*"$TAB"}
+				printf '%s\n' "$line" >> "$out"
+			done < "$in"
+			;;
+		array)
+			echo 'application/json' > "$ctype"
+			printf '{"host":"%s","events":[' "$(printf '%s' "$HOST_NAME" | json_escape)" >> "$out"
+			while IFS= read -r line; do
+				[ -n "$line" ] || continue
+				src=${line%%"$TAB"*}; line=${line#*"$TAB"}
+				epoch=${line%%"$TAB"*}; raw=${line#*"$TAB"}
+				ev=$(json_event "$src" "$epoch" "$raw")
+				[ "$first" = 1 ] || printf ',' >> "$out"
+				printf '%s' "$ev" >> "$out"
+				first=0
+			done < "$in"
+			printf ']}\n' >> "$out"
+			;;
+		splunk)
+			echo 'application/json' > "$ctype"
+			while IFS= read -r line; do
+				[ -n "$line" ] || continue
+				src=${line%%"$TAB"*}; line=${line#*"$TAB"}
+				epoch=${line%%"$TAB"*}; raw=${line#*"$TAB"}
+				ev=$(json_event "$src" "$epoch" "$raw")
+				printf '{"time":%s,"host":"%s","source":"openwrt","sourcetype":"openwrt:log","event":%s}\n' \
+					"$epoch" "$(printf '%s' "$HOST_NAME" | json_escape)" "$ev" >> "$out"
+			done < "$in"
+			;;
+		*)
+			echo 'application/x-ndjson' > "$ctype"
+			while IFS= read -r line; do
+				[ -n "$line" ] || continue
+				src=${line%%"$TAB"*}; line=${line#*"$TAB"}
+				epoch=${line%%"$TAB"*}; raw=${line#*"$TAB"}
+				json_event "$src" "$epoch" "$raw" >> "$out"
+				printf '\n' >> "$out"
+			done < "$in"
+			;;
+	esac
+	return 0
+}
+
+curl_cfg_escape() {
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+send_http() {
+	local in payload ctype cfg resp rc code body hdr
+
+	in=$1
+	command -v curl >/dev/null 2>&1 || { set_error "curl missing"; return 1; }
+	[ -n "$URL" ] || { set_error "http transport has no url"; return 1; }
+
+	payload="$SPOOL/.http.$$"
+	ctype="$SPOOL/.ctype.$$"
+	resp="$SPOOL/.resp.$$"
+	cfg="$SPOOL/.curlcfg.$$"
+
+	build_http_payload "$in" "$payload" "$ctype" || {
+		rm -f "$payload" "$ctype"; return 1
+	}
+	code=$(cat "$ctype" 2>/dev/null)
+
+	# Keep the URL (which may carry a query token) and credentials out of the
+	# process table; curl reads them from a 0600 config file instead.
+	if [ -n "$TOKEN_FILE" ] && [ -r "$TOKEN_FILE" ]; then
+		hdr=$(tr -d '\r\n' < "$TOKEN_FILE")
+		[ -n "$hdr" ] && [ -n "$AUTH_SCHEME" ] && hdr="$AUTH_SCHEME $hdr"
+	fi
+	( umask 077
+	  {
+		printf 'url = "%s"\n' "$(curl_cfg_escape "$URL")"
+		if [ -n "$hdr" ]; then
+			printf 'header = "%s: %s"\n' \
+				"$(curl_cfg_escape "$AUTH_HEADER")" "$(curl_cfg_escape "$hdr")"
+		fi
+		[ -n "$EXTRA_HEADER" ] && printf 'header = "%s"\n' "$(curl_cfg_escape "$EXTRA_HEADER")"
+	  } > "$cfg"
+	)
+
+	set -- --silent --show-error --max-time "$TIMEOUT" --connect-timeout 10 \
+		-o "$resp" -w '%{http_code}' -X POST \
+		-H "Content-Type: $code" --data-binary "@$payload" --config "$cfg"
+	if [ "$INSECURE" = 1 ]; then
+		set -- "$@" -k
+	elif [ -n "$CA_FILE" ]; then
+		set -- "$@" --cacert "$CA_FILE"
+	fi
+
+	code=$(curl "$@" 2>"$SPOOL/.curlerr.$$")
+	rc=$?
+	body=$(head -c 240 "$resp" 2>/dev/null | tr '\n\t' '  ')
+	rm -f "$payload" "$ctype" "$resp" "$cfg"
+
+	case "$code" in
+		2??)
+			rm -f "$SPOOL/.curlerr.$$"
+			LAST_OK=$(iso_now)
+			echo "$LAST_OK" > "$SPOOL/last-ok" 2>/dev/null
+			return 0
+			;;
+		401|403|408|429|5??|'')
+			# auth is fixable without losing data, so keep the batch queued
+			set_error "http $code: ${body:-$(head -n 1 "$SPOOL/.curlerr.$$" 2>/dev/null)}"
+			rm -f "$SPOOL/.curlerr.$$"
+			return 1
+			;;
+		4??)
+			if [ "$DROP_ON_4XX" = 1 ]; then
+				local n i
+				n=$(file_lines "$in")
+				i=$(read_num "$SPOOL/dropped" 0)
+				echo $((i + n)) > "$SPOOL/dropped"
+				log "http $code from SIEM; dropped $n events (drop_on_4xx=1)"
+				rm -f "$SPOOL/.curlerr.$$"
+				return 0
+			fi
+			set_error "http $code: $body"
+			rm -f "$SPOOL/.curlerr.$$"
+			return 1
+			;;
+		*)
+			set_error "curl rc=$rc: $(head -n 1 "$SPOOL/.curlerr.$$" 2>/dev/null)"
+			rm -f "$SPOOL/.curlerr.$$"
+			return 1
+			;;
+	esac
+}
+
+send_batch() {
+	case "$TRANSPORT" in
+		http)   send_http "$1" ;;
+		syslog) send_syslog "$1" ;;
+		*) set_error "unknown transport '$TRANSPORT'"; return 1 ;;
+	esac
+}
+
+# ---------------------------------------------------------------- flusher
+
+flush_once() {
+	local size off gen tmp used lines last cur
+
+	[ "$ACTIVE" = 1 ] || return 0
+	ensure_spool || return 1
+
+	size=$(file_size "$Q")
+	off=$(read_num "$SPOOL/off" 0)
+	[ "$off" -le "$size" ] || { off=0; echo 0 > "$SPOOL/off"; }
+
+	if [ "$size" -eq 0 ] || [ "$off" -ge "$size" ]; then
+		# fully drained — reclaim the file, but only while holding the lock so a
+		# concurrent append cannot be lost
+		if acquire_lock; then
+			cur=$(file_size "$Q")
+			if [ "$off" -ge "$cur" ]; then
+				: > "$Q"
+				echo 0 > "$SPOOL/off"
+			fi
+			release_lock
+		fi
+		return 0
+	fi
+
+	gen=$(read_num "$SPOOL/gen" 0)
+	tmp="$SPOOL/.batch.$$"
+	tail -c +$((off + 1)) "$Q" 2>/dev/null | head -n "$BATCH" > "$tmp"
+	[ -s "$tmp" ] || { rm -f "$tmp"; return 0; }
+
+	# Never ship a half-written trailing line; it stays queued for the next
+	# append to complete.
+	last=$(tail -c 1 "$tmp" 2>/dev/null | wc -l)
+	if [ "$last" -eq 0 ]; then
+		sed '$d' "$tmp" > "$tmp.trim" 2>/dev/null && mv -f "$tmp.trim" "$tmp"
+		[ -s "$tmp" ] || { rm -f "$tmp"; return 0; }
+	fi
+
+	used=$(file_size "$tmp")
+	lines=$(file_lines "$tmp")
+
+	if ! send_batch "$tmp"; then
+		rm -f "$tmp"
+		return 1
+	fi
+	LAST_OK=$(iso_now)
+	echo "$LAST_OK" > "$SPOOL/last-ok" 2>/dev/null
+
+	# Advance only if the file was not rewritten by compaction meanwhile.
+	if acquire_lock; then
+		cur=$(read_num "$SPOOL/gen" 0)
+		if [ "$cur" = "$gen" ]; then
+			off=$((off + used))
+			echo "$off" > "$SPOOL/off"
+			cur=$(file_size "$Q")
+			if [ "$off" -ge "$cur" ]; then
+				: > "$Q"
+				echo 0 > "$SPOOL/off"
+			fi
+		fi
+		release_lock
+	fi
+
+	SENT=$((SENT + lines))
+	echo "$SENT" > "$SPOOL/sent" 2>/dev/null
+	rm -f "$tmp"
+	return 0
+}
+
+write_status() { # write_status <state>
+	local state tmp qsize qoff
+
+	state=${1:-running}
+	tmp="$SPOOL/.status.$$"
+	ensure_spool >/dev/null 2>&1
+	qsize=$(file_size "$Q")
+	qoff=$(read_num "$SPOOL/off" 0)
+	[ "$qoff" -le "$qsize" ] || qoff=0
+	{
+		echo "state=$state"
+		echo "enabled=$ENABLED"
+		echo "target_enabled=$TARGET_ENABLED"
+		echo "active=$ACTIVE"
+		echo "transport=$TRANSPORT"
+		echo "target=$TARGET_NAME"
+		echo "endpoint=$(endpoint)"
+		echo "sources=$SOURCES"
+		echo "hostname=$HOST_NAME"
+		echo "queue_bytes=$((qsize - qoff))"
+		echo "queue_lines=$(tail -c +$((qoff + 1)) "$Q" 2>/dev/null | wc -l)"
+		echo "offset=$qoff"
+		echo "sent=$(read_num "$SPOOL/sent" 0)"
+		echo "dropped=$(read_num "$SPOOL/dropped" 0)"
+		echo "errors=$(read_num "$SPOOL/errors" 0)"
+		echo "last_success=$(cat "$SPOOL/last-ok" 2>/dev/null)"
+		echo "last_error=$(cat "$SPOOL/last-error" 2>/dev/null | tr '\n\t' '  ' | cut -c1-400)"
+		echo "updated=$(iso_now)"
+	} > "$tmp" 2>/dev/null
+	mv -f "$tmp" /tmp/siem.status 2>/dev/null || true
+	return 0
+}
+
+cmd_flush_loop() {
+	local backoff rc last_logged
+
+	load_config
+	ensure_spool || { log "cannot create spool $SPOOL"; exit 1; }
+	compact_spool
+	SENT=$(read_num "$SPOOL/sent" 0)
+	ERRORS=$(read_num "$SPOOL/errors" 0)
+	echo $$ > "$SPOOL/flush.pid" 2>/dev/null
+
+	trap 'rm -f "$SPOOL/flush.pid"; write_status stopped; exit 0' INT TERM HUP
+
+	backoff=0
+	RETRY_AT=0
+	last_logged=""
+
+	if [ "$ACTIVE" = 1 ]; then
+		log "forwarding to $(endpoint) (${TRANSPORT}; sources: $SOURCES)"
+	else
+		log "not active (enabled=$ENABLED target_enabled=$TARGET_ENABLED transport=$TRANSPORT)"
+	fi
+
+	while :; do
+		if [ "$ACTIVE" = 1 ] && [ "$(now)" -ge "$RETRY_AT" ]; then
+			if flush_once; then
+				backoff=0
+				RETRY_AT=0
+			else
+				backoff=$((backoff + 1))
+				[ "$backoff" -gt 6 ] && backoff=6
+				rc=$((INTERVAL * (1 << backoff)))
+				[ "$rc" -gt 300 ] && rc=300
+				RETRY_AT=$(( $(now) + rc ))
+				if [ "$LAST_ERROR" != "$last_logged" ]; then
+					log "delivery failed: $LAST_ERROR (retry in ${rc}s)"
+					last_logged=$LAST_ERROR
+				fi
+			fi
+		fi
+		write_status running
+		sleep "$INTERVAL"
+	done
+}
+
+# ---------------------------------------------------------------- collectors
+
+syslog_stream() { # filter + spool lines from stdin
+	local line
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		case "$line" in
+			'siem: '*|*' siem: '*|*']: siem: '*) continue ;;
+		esac
+		append_line syslog "$line"
+	done
+}
+
+cmd_collect_syslog() {
+	local fifo lrpid pidfile old
+
+	load_config
+	[ "$ACTIVE" = 1 ] || { log "target not configured; syslog collector idle"; return 0; }
+	ensure_spool || exit 1
+	compact_spool
+
+	# `logread -f` asks logd for lines=0: it streams NEW messages only, which
+	# is exactly what we want after a restart. There is no cursor in logd, so
+	# a gap while the collector is down cannot be replayed except with a full
+	# backfill (settings.syslog_backfill=1).
+	if [ "$SYSLOG_BACKFILL" = 1 ]; then
+		logread 2>/dev/null | syslog_stream
+	fi
+
+	command -v logread >/dev/null 2>&1 || {
+		log "logread missing; syslog collector cannot start"
+		return 1
+	}
+
+	# A FIFO (rather than `logread -f | filter`) lets the trap kill logread
+	# when procd stops this instance; logread ignores SIGPIPE and would
+	# otherwise linger after the reading end closed.
+	fifo="$SPOOL/.syslog.fifo"
+	pidfile="$SPOOL/logread.pid"
+
+	# If the collector was killed hard, clean up the logread it left behind.
+	if [ -f "$pidfile" ]; then
+		old=$(cat "$pidfile" 2>/dev/null)
+		case "$old" in
+			''|*[!0-9]*) ;;
+			*)
+				if grep -q logread "/proc/$old/cmdline" 2>/dev/null; then
+					kill "$old" 2>/dev/null
+				fi
+				;;
+		esac
+		rm -f "$pidfile"
+	fi
+
+	rm -f "$fifo"
+	if ! mkfifo "$fifo" 2>/dev/null; then
+		log "cannot create FIFO $fifo; falling back to a pipe"
+		while :; do
+			logread -f 2>/dev/null | syslog_stream
+			log "logread exited; reconnecting"
+			sleep 5
+		done
+	fi
+
+	lrpid=""
+	trap '[ -n "$lrpid" ] && kill "$lrpid" 2>/dev/null; rm -f "$fifo" "$pidfile"; exit 0' INT TERM HUP
+
+	while :; do
+		logread -f > "$fifo" 2>/dev/null &
+		lrpid=$!
+		echo "$lrpid" > "$pidfile"
+		syslog_stream < "$fifo"
+		kill "$lrpid" 2>/dev/null
+		wait "$lrpid" 2>/dev/null
+		lrpid=""
+		rm -f "$pidfile"
+		log "logread exited; reconnecting"
+		sleep 5
+	done
+}
+
+cmd_collect_file() { # cmd_collect_file <source>
+	local src file state ino_state off size tmp used last ino saved_ino ok
+
+	src=$1
+	load_config
+	case "$src" in
+		dns)    file=$DNS_FILE ;;
+		portal) file=$PORTAL_FILE ;;
+		*) return 1 ;;
+	esac
+	[ "$ACTIVE" = 1 ] || { log "target not configured; $src collector idle"; return 0; }
+	ensure_spool || exit 1
+	compact_spool
+	state="$SPOOL/state-$src.off"
+	ino_state="$SPOOL/state-$src.ino"
+
+	if [ -f "$state" ]; then
+		off=$(read_num "$state" 0)
+	else
+		# First run after a reboot: start at the current end instead of
+		# replaying the whole file (DNS logs can be 20 MB).
+		off=$(file_size "$file")
+		echo "$off" > "$state"
+	fi
+	[ -f "$file" ] && file_inode "$file" > "$ino_state" 2>/dev/null
+
+	while :; do
+		if [ ! -f "$file" ]; then
+			sleep 10
+			continue
+		fi
+		ino=$(file_inode "$file")
+		saved_ino=$(cat "$ino_state" 2>/dev/null)
+		if [ -n "$ino" ] && [ -n "$saved_ino" ] && [ "$ino" != "$saved_ino" ]; then
+			# replaced by log rotation, not just appended to
+			off=0
+		fi
+		[ -n "$ino" ] && echo "$ino" > "$ino_state"
+
+		size=$(file_size "$file")
+		if [ "$off" -gt "$size" ]; then
+			# rotated (mv) or truncated; start at the new beginning
+			off=0
+		fi
+		if [ "$off" -ge "$size" ]; then
+			sleep 1
+			continue
+		fi
+
+		tmp="$SPOOL/.read.$$"
+		tail -c +$((off + 1)) "$file" 2>/dev/null | head -n "$BATCH" > "$tmp"
+		[ -s "$tmp" ] || { rm -f "$tmp"; sleep 1; continue; }
+
+		# Do not consume a half-written last line.
+		last=$(tail -c 1 "$tmp" 2>/dev/null | wc -l)
+		if [ "$last" -eq 0 ]; then
+			sed '$d' "$tmp" > "$tmp.trim" 2>/dev/null && mv -f "$tmp.trim" "$tmp"
+			[ -s "$tmp" ] || { rm -f "$tmp"; sleep 1; continue; }
+		fi
+		used=$(file_size "$tmp")
+
+		ok=1
+		while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			append_line "$src" "$line" || ok=0
+		done < "$tmp"
+
+		if [ "$ok" = 1 ]; then
+			off=$((off + used))
+			echo "$off" > "$state"
+		else
+			# leave the offset alone and retry the chunk (may duplicate the
+			# lines that did make it; delivery is at-least-once)
+			sleep 1
+		fi
+		rm -f "$tmp"
+	done
+}
+
+cmd_collect() {
+	case "$1" in
+		syslog) cmd_collect_syslog ;;
+		dns|portal) cmd_collect_file "$1" ;;
+		*) echo "unknown source '$1'" >&2; exit 2 ;;
+	esac
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_status() {
+	load_config
+	if [ -s /tmp/siem.status ]; then
+		cat /tmp/siem.status
+	else
+		ensure_spool >/dev/null 2>&1
+		local qsize qoff
+		qsize=$(file_size "$Q")
+		qoff=$(read_num "$SPOOL/off" 0)
+		[ "$qoff" -le "$qsize" ] || qoff=0
+		{
+			echo "state=stopped"
+			echo "enabled=$ENABLED"
+			echo "target_enabled=$TARGET_ENABLED"
+			echo "active=$ACTIVE"
+			echo "transport=$TRANSPORT"
+			echo "target=$TARGET_NAME"
+			echo "endpoint=$(endpoint)"
+			echo "sources=$SOURCES"
+			echo "hostname=$HOST_NAME"
+			echo "queue_bytes=$((qsize - qoff))"
+			echo "queue_lines=$(tail -c +$((qoff + 1)) "$Q" 2>/dev/null | wc -l)"
+			echo "offset=$qoff"
+			echo "sent=$(read_num "$SPOOL/sent" 0)"
+			echo "dropped=$(read_num "$SPOOL/dropped" 0)"
+			echo "errors=$(read_num "$SPOOL/errors" 0)"
+			echo "last_success=$(cat "$SPOOL/last-ok" 2>/dev/null)"
+			echo "last_error=$(cat "$SPOOL/last-error" 2>/dev/null | tr '\n\t' '  ' | cut -c1-400)"
+			echo "updated=$(iso_now)"
+		}
+	fi
+}
+
+cmd_test() {
+	local tmp
+
+	load_config
+	ensure_spool >/dev/null 2>&1
+	if [ "$TRANSPORT" = http ]; then
+		[ -n "$URL" ] || { echo "failed: no url configured"; return 1; }
+	elif [ -z "$HOST" ]; then
+		echo "failed: no syslog host configured"
+		return 1
+	fi
+
+	tmp="$SPOOL/.test.$$"
+	printf 'test\t%s\t%s\n' "$(now)" \
+		"siem-forward test event host=$HOST_NAME transport=$TRANSPORT" > "$tmp"
+	if send_batch "$tmp"; then
+		rm -f "$tmp"
+		echo "ok: delivered test event to $(endpoint)"
+		return 0
+	fi
+	rm -f "$tmp"
+	echo "failed: ${LAST_ERROR:-delivery failed} ($(endpoint))"
+	return 1
+}
+
+cmd_flush() {
+	load_config
+	ensure_spool || exit 1
+	SENT=$(read_num "$SPOOL/sent" 0)
+	ERRORS=$(read_num "$SPOOL/errors" 0)
+	flush_once
+}
+
+cmd_compact() {
+	load_config
+	ensure_spool || exit 1
+	compact_spool
+}
+
+usage() {
+	cat <<'EOF'
+Usage: siem-forward <command>
+  flush-loop          run the queue flusher (procd)
+  collect <source>    syslog | dns | portal (procd)
+  flush               deliver one batch now
+  compact             enforce the spool size cap now
+  test                send one synthetic event through the transport
+  status              print key=value status
+EOF
+}
+
+case "${1:-}" in
+	flush-loop)  cmd_flush_loop ;;
+	collect)     cmd_collect "${2:-}" ;;
+	flush)       cmd_flush ;;
+	compact)     cmd_compact ;;
+	test)        cmd_test ;;
+	status)      cmd_status ;;
+	*)           usage; exit 2 ;;
+esac

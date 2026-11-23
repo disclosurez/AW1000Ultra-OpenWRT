@@ -1,0 +1,275 @@
+<%+header%>
+<%
+local uci  = require "luci.model.uci".cursor()
+local fs   = require "nixio.fs"
+local sys  = require "luci.sys"
+local util = require "luci.util"
+local pcdata = util.pcdata
+
+local function get(opt, default)
+	local v = uci:get("cloudflare", "ddns", opt)
+	if v == nil or v == "" then return default end
+	return v
+end
+
+local domains  = get("domains", "")
+local proxied  = get("proxied", "0")
+local ip4      = get("ip4_provider", "cloudflare.trace")
+local ip6      = get("ip6_provider", "none")
+local cron     = get("update_cron", "@every 5m")
+local enabled  = get("enabled", "1")
+local tok_file = get("token_file", "/etc/cloudflare-ddns.token")
+local has_tok  = fs.access(tok_file) and (fs.stat(tok_file, "size") or 0) > 0
+local running  = (sys.call("pgrep -f cloudflare-ddns >/dev/null 2>&1") == 0)
+local saved    = luci.http.formvalue("saved")
+
+local function split_domains(s)
+	local t = {}
+	for d in (s or ""):gmatch("[^%s,]+") do t[#t + 1] = d end
+	return t
+end
+
+local function resolve4(name)
+	local ips = {}
+	local out = sys.exec("nslookup " .. name .. " 127.0.0.1 2>/dev/null") or ""
+	for ip in out:gmatch("[Aa]ddress%s*%d*:?%s*(%d+%.%d+%.%d+%.%d+)") do
+		if not ip:match("^127%.") then ips[#ips + 1] = ip end
+	end
+	return ips[1] or ""
+end
+
+local wan = (sys.exec("ip route get 1.1.1.1 2>/dev/null") or ""):match("src%s+(%d+%.%d+%.%d+%.%d+)")
+local dlist = split_domains(domains)
+
+local providers = { "cloudflare.trace", "local", "cloudflare.doh" }
+%>
+
+<script type="text/javascript">
+//<![CDATA[
+(function () {
+	var url = '<%=url("admin/services/cloudflare/status")%>';
+	var els;
+
+	function dot(on) {
+		return on ? '<span class="cf-dot cf-on"></span>' : '<span class="cf-dot cf-off"></span>';
+	}
+	function esc(s) {
+		return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+	}
+	function render(d) {
+		if (!d || !d.ddns) return;
+		var s = document.getElementById("cf-state");
+		if (s) s.innerHTML = dot(d.ddns.running) + (d.ddns.running ? "<%:running%>" : "<%:stopped%>");
+		var w = document.getElementById("cf-wan");
+		if (w) w.textContent = d.ddns.wan || "—";
+		var b = document.getElementById("cf-dns-body");
+		if (b && d.ddns.dns) {
+			var html = "";
+			for (var i = 0; i < d.ddns.dns.length; i++) {
+				var r = d.ddns.dns[i];
+				var match = d.ddns.wan && r.ip === d.ddns.wan;
+				html += "<tr><td>" + esc(r.name) + "</td><td>" +
+					(r.ip ? "<span class='cf-dot " + (match ? "cf-on" : "cf-warn") + "'></span>" + esc(r.ip)
+					      : "<span class='cf-dot cf-off'></span><%:not resolved%>") + "</td></tr>";
+			}
+			b.innerHTML = html;
+		}
+		var l = document.getElementById("cf-log");
+		if (l && d.log) l.textContent = d.log;
+		var t = document.getElementById("cf-ts");
+		if (t) t.textContent = d.ddns.ts || "";
+	}
+	function poll() {
+		var body = "token=" + encodeURIComponent("<%=token%>");
+		fetch(url, { method: "POST", credentials: "same-origin",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: body })
+			.then(function (r) { return r.ok ? r.json() : null; })
+			.then(function (d) { if (d) render(d); })
+			.catch(function () {});
+	}
+	if (window.fetch) { setInterval(poll, 15000); setTimeout(poll, 1200); }
+})();
+//]]>
+</script>
+
+<style type="text/css">
+.cf-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+.cf-on   { background:#5cb85c; }
+.cf-off  { background:#d9534f; }
+.cf-warn { background:#f0ad4e; }
+.cf-log  { background:#1e1e1e; color:#d0d0d0; font-size:11px; line-height:1.45; padding:10px 12px;
+           border-radius:4px; max-height:170px; overflow:auto; white-space:pre-wrap; word-break:break-all; margin:0; }
+.cf-mono { font-family:monospace; }
+</style>
+
+<h2 name="content"><%:Cloudflare Dynamic DNS%></h2>
+
+<p class="cbi-map-descr">
+	<%:Keeps the A record of the domains below pointed at this router's WAN address. The updater checks every few minutes, follows IP changes automatically, and restarts after a reboot. Only DNS records are managed — the API token is stored in%>
+	<code><%=pcdata(tok_file)%></code> <%:(mode 0600).%>
+</p>
+
+<% if saved then %>
+<div class="alert-message success" style="margin:10px 0;padding:8px 12px;background:#dff0d8;border:1px solid #d6e9c6;border-radius:4px">
+	<%:Settings saved and the updater was restarted.%>
+</div>
+<% end %>
+
+<div class="cbi-section">
+	<h3><%:Status%></h3>
+	<div class="cbi-section-node">
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Service%></label>
+			<div class="cbi-value-field" id="cf-state">
+				<span class="cf-dot <%= running and "cf-on" or "cf-off" %>"></span><%= running and translate("running") or translate("stopped") %>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Router WAN address%></label>
+			<div class="cbi-value-field cf-mono" id="cf-wan"><%= wan and pcdata(wan) or "—" %></div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Public DNS answers%></label>
+			<div class="cbi-value-field">
+				<table class="cbi-section-table" style="max-width:420px">
+					<thead><tr><th><%:Domain%></th><th><%:A record%></th></tr></thead>
+					<tbody id="cf-dns-body">
+					<% if #dlist == 0 then %>
+						<tr><td colspan="2"><em><%:No domains configured yet.%></em></td></tr>
+					<% else
+						for _, d in ipairs(dlist) do
+							local ip = resolve4(d)
+							local ok = wan and ip == wan
+					%>
+						<tr>
+							<td><%=pcdata(d)%></td>
+							<td>
+							<% if ip ~= "" then %>
+								<span class="cf-dot <%= ok and "cf-on" or "cf-warn" %>"></span><span class="cf-mono"><%=pcdata(ip)%></span>
+							<% else %>
+								<span class="cf-dot cf-off"></span><em><%:not resolved%></em>
+							<% end %>
+							</td>
+						</tr>
+					<% end end %>
+					</tbody>
+				</table>
+			</div>
+		</div>
+	</div>
+</div>
+
+<div class="cbi-section">
+	<h3><%:Recent updater log%> <small id="cf-ts" class="cf-mono"></small></h3>
+	<pre class="cf-log" id="cf-log"><%
+		local out = sys.exec("logread -e 'cloudflare-ddns' 2>/dev/null | tail -n 8")
+		if out and out:gsub("%s", "") ~= "" then
+			luci.http.write(pcdata(out))
+		else
+			luci.http.write(translate("No log entries yet."))
+		end
+	%></pre>
+</div>
+
+<form method="post" action="<%=url('admin/services/cloudflare/save_ddns')%>" class="cbi-map">
+<input type="hidden" name="token" value="<%=token%>" />
+<input type="hidden" name="saved" value="1" />
+
+<div class="cbi-section">
+	<h3><%:Settings%></h3>
+	<div class="cbi-section-node">
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Updater enabled%></label>
+			<div class="cbi-value-field">
+				<input type="checkbox" name="enabled" value="1" <%= (enabled ~= "0") and "checked" or "" %> />
+				<div class="cbi-value-description"><%:Turn the updater off to leave the DNS record untouched.%></div>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Domains%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="domains" value="<%=pcdata(domains)%>" placeholder="vpn.example.com" style="width:100%;max-width:520px" />
+				<div class="cbi-value-description"><%:Comma or space separated. Wildcards such as *.example.org are allowed. Each name needs a matching zone in the Cloudflare account.%></div>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Cloudflare API token%></label>
+			<div class="cbi-value-field">
+				<input type="password" class="cbi-input-text" name="api_token" value="" autocomplete="new-password"
+					placeholder="<%= has_tok and translate("unchanged — a token is already stored") or translate("paste token") %>"
+					style="width:100%;max-width:520px" />
+				<div class="cbi-value-description">
+					<%:Needs the%> <code>Zone → DNS → Edit</code> <%:permission for the zone. Leave blank to keep the stored token.%>
+				</div>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Proxied records%></label>
+			<div class="cbi-value-field">
+				<input type="checkbox" name="proxied" value="1" <%= (proxied == "1") and "checked" or "" %> />
+				<div class="cbi-value-description">
+					<%:Applies to records the updater creates; existing records keep their own orange-cloud setting. Keep this off for non-HTTP services such as the WireGuard endpoint.%>
+				</div>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:IPv4 detection%></label>
+			<div class="cbi-value-field">
+				<select name="ip4_provider" class="cbi-input-select">
+				<%
+					local seen = {}
+					for _, p in ipairs(providers) do
+						seen[p] = true
+				%>
+					<option value="<%=pcdata(p)%>" <%= (ip4 == p) and "selected" or "" %>><%=pcdata(p)%></option>
+				<% end
+					if not seen[ip4] then %>
+					<option value="<%=pcdata(ip4)%>" selected><%=pcdata(ip4)%></option>
+				<% end %>
+				</select>
+				<div class="cbi-value-description">
+					<code>cloudflare.trace</code> <%:asks Cloudflare what address it sees — the right choice here.%>
+				</div>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:IPv6 records%></label>
+			<div class="cbi-value-field">
+				<select name="ip6_provider" class="cbi-input-select">
+				<%
+					local v6 = { "none", "cloudflare.trace", "local", "cloudflare.doh" }
+					local seen6 = {}
+					for _, p in ipairs(v6) do
+						seen6[p] = true
+				%>
+					<option value="<%=pcdata(p)%>" <%= (ip6 == p) and "selected" or "" %>><%=pcdata(p)%></option>
+				<% end
+					if not seen6[ip6] then %>
+					<option value="<%=pcdata(ip6)%>" selected><%=pcdata(ip6)%></option>
+				<% end %>
+				</select>
+				<div class="cbi-value-description"><%:none keeps AAAA records untouched.%></div>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Check interval%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="update_cron" value="<%=pcdata(cron)%>" style="width:220px" />
+				<div class="cbi-value-description"><%:Cron expression, for example @every 5m. Changes apply on the next run.%></div>
+			</div>
+		</div>
+	</div>
+</div>
+
+<div class="cbi-page-actions">
+	<input type="submit" class="cbi-button cbi-button-save" value="<%:Save & restart%>" />
+</div>
+</form>
+
+<%+footer%>

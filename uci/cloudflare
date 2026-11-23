@@ -1,0 +1,25 @@
+# Seed for /etc/config/cloudflare — written only if the file does not exist.
+# Managed by LuCI: Services -> Cloudflare.
+#
+# Tokens are NEVER stored here. The DDNS API token lives in token_file (0600),
+# each connector token in its own 0600 file. Nothing is passed on the command
+# line.
+
+config ddns 'ddns'
+	option enabled '0'
+	option domains 'vpn.example.com'
+	option proxied '0'
+	# cloudflare.trace is the reliable choice on this firmware; cloudflare.doh
+	# fails where TLS to 1.1.1.1 is intercepted.
+	option ip4_provider 'cloudflare.trace'
+	option ip6_provider 'none'
+	option update_cron '@every 5m'
+	option token_file '/etc/cloudflare-ddns.token'
+
+# One section per cloudflared connector. Ingress / public hostnames are stored
+# in the Cloudflare dashboard for token-based tunnels, so the router only dials
+# out and needs no reconfiguration when hostnames change.
+config tunnel 't_router'
+	option enabled '0'
+	option name 'router'
+	option token_file '/etc/cloudflare-tunnel-t_router.token'

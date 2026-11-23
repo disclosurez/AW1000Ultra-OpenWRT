@@ -1,0 +1,30 @@
+# Seed for /etc/config/wanfailover — written only if the file does not exist.
+# The watchdog resolves the modem device from ubus on every cycle; the
+# modem_device below is only the initial hint.
+
+config settings 'settings'
+	option enabled '1'
+
+	# wired WAN — plain DHCP on the physical WAN port
+	option wan_device 'eth1'
+	option wan_iface 'isp'
+
+	# 5G modem. The section MUST stay named "wan" (vendor binaries hardcode it).
+	option modem_device 'ccmni2'
+	option modem_iface 'wan'
+
+	# UCI fallback metrics: with the watchdog dead, ISP 40 beats SIM 50.
+	# Live metrics use separate per-device slots (ISP 10/60, SIM 20/50).
+	option active_metric '10'
+	option standby_metric '50'
+
+	option interval '3'
+	option ping_hosts '1.1.1.1 8.8.8.8'
+	option fail_tries '2'
+	option ok_tries '2'
+
+	# 1 = bring the SIM down while the ISP answers (no SIM data, no IPv6 leak)
+	# 0 = keep it dialled as a hot standby (route metric 50, IPv6 still leaks)
+	option sim_park '1'
+	option sim_wait '40'
+	option conntrack_flush '1'

@@ -1,0 +1,15 @@
+#!/bin/sh
+# Cron watchdog: make sure routing table 100 points at the selected VPN.
+# Fixes the route if the tunnel comes up without a netifd hotplug event
+# (e.g. OpenVPN) and keeps fail-closed behaviour when it is down.
+ip rule show | grep -q 'fwmark 0x1 lookup 100' || exit 0
+
+VPN=$(uci -q get vpnsplit.settings.vpn)
+[ -n "$VPN" ] || VPN=wgvpn
+
+if ip -4 addr show "$VPN" 2>/dev/null | grep -q 'inet '; then
+	ip route replace default dev "$VPN" table 100
+else
+	ip route show table 100 | grep -q '^blackhole default' ||
+		ip route replace blackhole default table 100
+fi

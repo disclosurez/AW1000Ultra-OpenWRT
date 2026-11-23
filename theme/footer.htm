@@ -1,0 +1,26 @@
+<% local ver = require "luci.version" %>
+<% if blank_page then %>
+</div><!-- /login-shell -->
+<% else %>
+			</div><!-- /maincontent -->
+
+			<div class="page-foot">
+				<span><%=pcdata((ver.distversion or "OpenWrt"):gsub("^%s+", ""))%></span>
+				<span class="page-foot-sep">·</span>
+				<span>LuCI <%=pcdata(ver.luciversion or "")%></span>
+				<span class="page-foot-right">AW1000 Console</span>
+			</div>
+		</main>
+	</div><!-- /shell -->
+
+	<div class="scrim" id="scrim" hidden></div>
+	<ul class="breadcrumb" id="modemenu" style="display:none"></ul>
+</div><!-- /app -->
+<% end %>
+
+<% if luci.dispatcher.context.authsession and not blank_page then %>
+<script>L.require('menu-console3')</script>
+<% end %>
+<script src="<%=media%>/console.js?v=console-11"></script>
+</body>
+</html>

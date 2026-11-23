@@ -1,0 +1,64 @@
+#!/bin/sh
+# Sample per-device traffic counters (bytes up/down) and persist totals
+# in /etc/parental_usage. Runs from cron; counters live in iptables so
+# they survive re-applies unless the device's IP changes.
+
+MAP=/tmp/parental.acct.map
+LAST=/tmp/parental.acct.last
+DB=/etc/parental_usage
+CHAIN=PARENTAL_ACCT
+NOW=$(date +%s)
+
+[ -f "$MAP" ] || exit 0
+
+iptables -n -v -x -L "$CHAIN" > /tmp/parental.acct.raw 2>/dev/null || exit 0
+awk 'NR>2 {print $2}' /tmp/parental.acct.raw > /tmp/parental.acct.cur
+[ -s /tmp/parental.acct.cur ] || exit 0
+
+[ -f "$DB" ] || : > "$DB"
+
+i=0
+: > "$LAST.new"
+
+while IFS='|' read -r mac ip; do
+	up=$(sed -n "$((i * 2 + 1))p" /tmp/parental.acct.cur)
+	down=$(sed -n "$((i * 2 + 2))p" /tmp/parental.acct.cur)
+	up=${up:-0}
+	down=${down:-0}
+
+	prev=$(grep -F "$mac|" "$LAST" 2>/dev/null | head -1)
+	pu=$(echo "$prev" | cut -d'|' -f2)
+	pd=$(echo "$prev" | cut -d'|' -f3)
+	[ -n "$pu" ] || pu=0
+	[ -n "$pd" ] || pd=0
+
+	du=$((up - pu))
+	dd=$((down - pd))
+	[ "$du" -lt 0 ] && du=$up
+	[ "$dd" -lt 0 ] && dd=$down
+
+	line=$(grep -F "$mac|" "$DB" 2>/dev/null | head -1)
+	if [ -n "$line" ]; then
+		tu=$(echo "$line" | cut -d'|' -f2)
+		td=$(echo "$line" | cut -d'|' -f3)
+		grep -v -F "$mac|" "$DB" > "$DB.tmp" 2>/dev/null
+		mv "$DB.tmp" "$DB"
+	else
+		tu=0
+		td=0
+	fi
+	[ -n "$tu" ] || tu=0
+	[ -n "$td" ] || td=0
+
+	echo "$mac|$((tu + du))|$((td + dd))|$NOW" >> "$DB"
+	echo "$mac|$up|$down" >> "$LAST.new"
+
+	i=$((i + 1))
+done < "$MAP"
+
+mv "$LAST.new" "$LAST"
+
+# keep the database tidy
+if [ "$(wc -l < "$DB")" -gt 200 ]; then
+	tail -n 200 "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+fi

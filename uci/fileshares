@@ -1,0 +1,16 @@
+config settings 'settings'
+	# Work directory for transfers (RAM). Files are moved to/from the share
+	# immediately; nothing is kept here.
+	option workdir '/tmp/fileshares'
+	option timeout '30'
+
+# One section per SMB share. Passwords are NOT stored here: they live in
+# /etc/fileshares.secrets (mode 600), one "section=password" line each.
+# config share 'nas'
+# 	option label 'NAS'
+# 	option host '192.168.1.20'
+# 	option share 'test'
+# 	option port '445'
+# 	option user 'root'
+# 	option domain 'WORKGROUP'
+# 	option guest '0'

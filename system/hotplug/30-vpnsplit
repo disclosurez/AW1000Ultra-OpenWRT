@@ -1,0 +1,27 @@
+#!/bin/sh
+# Keep policy routing in sync with the selected VPN interface state.
+VPN=$(uci -q get vpnsplit.settings.vpn)
+[ -n "$VPN" ] || VPN=wgvpn
+[ "$INTERFACE" = "$VPN" ] || exit 0
+
+logger -t vpnsplit "vpn $VPN $ACTION"
+
+dns=$(uci -q get vpnsplit.settings.dns)
+[ -n "$dns" ] || dns=103.86.96.100
+
+case "$ACTION" in
+ifup)
+	ipset create vpnset hash:net -exist
+	ipset add vpnset "$dns" -exist
+	ipset add vpnset 103.86.96.100 -exist
+	ipset add vpnset 103.86.99.100 -exist
+	for ip in $(uci -q get vpnsplit.settings.ips); do
+		ipset add vpnset "$ip" -exist
+	done
+	ip rule add fwmark 0x1 table 100 priority 100 2>/dev/null
+	ip route replace default dev "$VPN" table 100
+	;;
+ifdown)
+	ip route replace blackhole default table 100
+	;;
+esac

@@ -1,0 +1,84 @@
+<%+header%>
+<%
+local sys  = require "luci.sys"
+local util = require "luci.util"
+local pcdata = util.pcdata
+
+local raw = sys.exec("top -b -n1 2>/dev/null") or ""
+local procs = {}
+
+local mem_used, mem_free = raw:match("Mem:%s+(%d+)K%s+used,%s+(%d+)K%s+free")
+local cpu_usr, cpu_sys, cpu_nic, cpu_idle =
+	raw:match("CPU:%s+([%d%.]+)%%%s+usr%s+([%d%.]+)%%%s+sys%s+([%d%.]+)%%%s+nic%s+([%d%.]+)%%%s+idle")
+local load1, load5, load15, running, total =
+	raw:match("Load average:%s+([%d%.]+)%s+([%d%.]+)%s+([%d%.]+)%s+(%d+)/(%d+)")
+
+for line in raw:gmatch("[^\n]+") do
+	local pid, ppid, user, stat, vsz, vszp, cpu, cpup, cmd =
+		line:match("^%s*(%d+)%s+(%d+)%s+(%S+)%s+(%S+)%s+(%S+)%s+([%d%.]+)%s+(%d+)%s+([%d%.]+)%s+(.+)$")
+	if pid then
+		procs[#procs + 1] = {
+			pid = pid, ppid = ppid, user = user, stat = stat,
+			vsz = vsz, vszp = vszp, cpu = cpu, cpup = cpup, cmd = cmd
+		}
+	end
+end
+%>
+<h2 name="content"><%:Processes%></h2>
+<p class="cbi-map-descr"><%:Live process snapshot from top. Read-only. The stock Processes page is empty on this firmware because its ubus method returns no data; this page reads top directly.%></p>
+
+<div style="display:flex;gap:12px;flex-wrap:wrap;margin:14px 0">
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=#procs%></b><br><%:processes%></div>
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=load1 or "—"%> / <%=load5 or "—"%> / <%=load15 or "—"%></b><br><%:load 1 / 5 / 15 min%></div>
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=mem_used or "—"%>K</b><br><%:memory used%></div>
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=mem_free or "—"%>K</b><br><%:memory free%></div>
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=cpu_idle or "—"%>%</b><br><%:CPU idle%> · <%=running or "—"%>/<%=total or "—"%> <%:running%></div>
+</div>
+
+<div class="cbi-section" style="padding:12px 16px;margin-bottom:14px">
+	<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+		<input id="proc-q" type="search" placeholder="<%:Filter by PID, user or command%>" style="flex:1;min-width:260px" oninput="procFilter()" />
+		<button type="button" class="btn" onclick="awLog.downloadTable('proc-table','processes.csv')"><%:Download%></button>
+		<button type="button" class="btn" onclick="awLog.copyTable('proc-table', this)"><%:Copy log%></button>
+		<button type="button" class="btn" onclick="location.reload()"><%:Refresh%></button>
+	</div>
+</div>
+
+<div style="max-height:640px;overflow:auto">
+<table class="cbi-section-table" id="proc-table">
+	<thead><tr>
+		<th><%:PID%></th><th><%:PPID%></th><th><%:User%></th><th><%:State%></th>
+		<th style="text-align:right"><%:VSZ%></th><th style="text-align:right">%VSZ</th>
+		<th style="text-align:right">CPU</th><th style="text-align:right">%CPU</th>
+		<th><%:Command%></th>
+	</tr></thead>
+	<tbody>
+	<% for _, p in ipairs(procs) do %>
+	<tr>
+		<td class="mono"><%=p.pid%></td>
+		<td class="mono"><%=p.ppid%></td>
+		<td><%=pcdata(p.user)%></td>
+		<td class="mono"><%=pcdata(p.stat)%></td>
+		<td style="text-align:right" class="mono"><%=pcdata(p.vsz)%></td>
+		<td style="text-align:right"><%=pcdata(p.vszp)%></td>
+		<td style="text-align:right"><%=pcdata(p.cpu)%></td>
+		<td style="text-align:right"><%=pcdata(p.cpup)%></td>
+		<td class="mono" style="font-size:12px;word-break:break-word"><%=pcdata(p.cmd)%></td>
+	</tr>
+	<% end %>
+	<% if #procs == 0 then %><tr><td colspan="9"><em><%:No process data.%></em></td></tr><% end %>
+	</tbody>
+</table>
+</div>
+
+<script type="text/javascript">
+function procFilter() {
+	var q = (document.getElementById('proc-q').value || '').toLowerCase();
+	var rows = document.querySelectorAll('#proc-table tbody tr');
+	for (var i = 0; i < rows.length; i++) {
+		var txt = (rows[i].innerText || rows[i].textContent || '').toLowerCase();
+		rows[i].style.display = (!q || txt.indexOf(q) !== -1) ? '' : 'none';
+	}
+}
+</script>
+<%+footer%>

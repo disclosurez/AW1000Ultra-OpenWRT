@@ -1,0 +1,5 @@
+#!/bin/sh
+# fw3 include: re-apply the portal chains after every firewall reload.
+# apply_rules() clears the chains first, so a disabled portal leaves none.
+/usr/sbin/captiveportal apply >/dev/null 2>&1
+exit 0

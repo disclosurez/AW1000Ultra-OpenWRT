@@ -1,0 +1,27 @@
+# Seed for /etc/config/parental — written only if the file does not exist.
+# Managed from LuCI: Network -> Parental Control.
+#
+# Device section:
+#   config device
+#       option enabled '1'
+#       option name    'Children tablet'
+#       option mac     '02:00:00:00:00:01'
+#       option mode    'schedule'          # or 'ban'
+#       option start   '20:00'
+#       option end     '07:00'
+#       list   days    'mon' 'tue' 'wed' 'thu' 'fri'
+#
+# Domain section:
+#   config domain
+#       option enabled '1'
+#       option domain  'example.com'
+#       option target  'all'               # or 'mac:AA:BB:CC:DD:EE:FF'
+#       option days    ''                  # empty = every day
+#       option start   ''
+#       option end     ''
+#
+# settings.exempt is a list of MACs that are never enforced. Keep the MAC of
+# the machine you administer from in it.
+
+config settings 'settings'
+	# list exempt 'AA:BB:CC:DD:EE:FF'

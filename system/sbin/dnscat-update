@@ -1,0 +1,121 @@
+#!/bin/sh
+# Refresh the local DNS category table from nDPI's open-source match data.
+# Custom overrides live in /data/dnscat/custom.tsv and are never touched.
+
+DIR=/data/dnscat
+URL=https://raw.githubusercontent.com/ntop/nDPI/dev/src/lib/ndpi_content_match.c.inc
+TMP=/tmp/ndpi_content_match.inc
+OUT=$DIR/ndpi.tsv
+
+mkdir -p "$DIR"
+uclient-fetch -q -O "$TMP" "$URL" 2>/dev/null || wget -q -O "$TMP" "$URL" 2>/dev/null || exit 1
+[ -s "$TMP" ] || exit 1
+
+awk '
+function friendly(c) {
+	if (c == "ADULT_CONTENT") return "Adult"
+	if (c == "ADVERTISEMENT") return "Ads & tracking"
+	if (c == "SOCIAL_NETWORK") return "Social"
+	if (c == "CHAT") return "Social"
+	if (c == "STREAMING") return "Streaming"
+	if (c == "VIDEO") return "Streaming"
+	if (c == "MUSIC") return "Streaming"
+	if (c == "MEDIA") return "Streaming"
+	if (c == "GAME") return "Gaming"
+	if (c == "SHOPPING") return "Shopping"
+	if (c == "CLOUD") return "Cloud / CDN"
+	if (c == "DATA_TRANSFER") return "Cloud / CDN"
+	if (c == "CDN_PROXY") return "Cloud / CDN"
+	if (c == "WEB") return "Web"
+	if (c == "SOFTWARE_UPDATE") return "Software"
+	if (c == "SW_UPDATE") return "Software"
+	if (c == "SYSTEM_OS") return "Software"
+	if (c == "CYBERSECURITY") return "Security"
+	if (c == "COMMUNICATION") return "Communication"
+	if (c == "EMAIL") return "Communication"
+	if (c == "MAIL") return "Communication"
+	if (c == "VOIP") return "Communication"
+	if (c == "VPN") return "VPN / proxy"
+	if (c == "PROXY") return "VPN / proxy"
+	if (c == "DOWNLOAD_FT") return "Downloads"
+	if (c == "P2P") return "Downloads"
+	if (c == "NEWS") return "News"
+	if (c == "FINANCE") return "Finance"
+	if (c == "BANKING") return "Finance"
+	if (c == "CRYPTO_BLOCKCHAIN") return "Finance"
+	if (c == "EDUCATION") return "Education"
+	if (c == "GOVERNMENT") return "Government"
+	if (c == "HEALTH") return "Health"
+	if (c == "VIRTUAL_ASSISTANT") return "Software"
+	if (c == "COLLABORATIVE") return "Software"
+	if (c == "PRODUCTIVITY") return "Software"
+	if (c == "ARTIFICIAL_INTELLIGENCE") return "Software"
+	if (c == "BUSINESS") return "Business"
+	if (c == "IOT_SCADA") return "IoT"
+	if (c == "CONNECTIVITY_CHECK") return "Infrastructure"
+	if (c == "NETWORK") return "Infrastructure"
+	if (c == "DATABASES") return "Developer"
+	if (c == "DATABASE") return "Developer"
+	if (c == "REMOTE_ACCESS") return "Remote access"
+	if (c == "ANTIMALWARE") return "Security"
+	if (c == "SEARCH_ENGINE") return "Web"
+	if (c == "WEAPONS") return "Weapons"
+	if (c == "VIOLENCE") return "Violence"
+	if (c == "DRUGS") return "Drugs"
+	if (c == "CHILDREN") return "Children"
+	return ""
+}
+function rank(c) {
+	if (c == "Adult") return 1
+	if (c == "Ads & tracking") return 2
+	if (c == "Security") return 3
+	if (c == "VPN / proxy") return 4
+	if (c == "Downloads") return 5
+	if (c == "Gaming") return 6
+	if (c == "Streaming") return 7
+	if (c == "Social") return 8
+	if (c == "Shopping") return 9
+	if (c == "Finance") return 10
+	if (c == "News") return 11
+	if (c == "Education") return 12
+	if (c == "Government") return 13
+	if (c == "Health") return 14
+	if (c == "Communication") return 15
+	if (c == "Cloud / CDN") return 16
+	if (c == "Software") return 17
+	if (c == "Developer") return 18
+	if (c == "Infrastructure") return 19
+	return 50
+}
+{
+	if ($0 !~ /NDPI_PROTOCOL_CATEGORY_/) next
+	if (!match($0, /"[^"]+"/)) next
+	d = substr($0, RSTART + 1, RLENGTH - 2)
+	if (d == "" || d ~ /^[-+]/) next
+	sub(/\.$/, "", d)
+	if (index(d, ".") == 0) next
+	if (!match($0, /NDPI_PROTOCOL_CATEGORY_[A-Z0-9_]+/)) next
+	c = substr($0, RSTART + 23, RLENGTH - 23)
+	f = friendly(c)
+	if (f == "") next
+	r = rank(f)
+	if (!(d in best) || r < br[d]) {
+		best[d] = f
+		br[d] = r
+	}
+}
+END {
+	for (d in best)
+		print d "\t" best[d]
+}
+' "$TMP" | sort > "$OUT.tmp"
+
+if [ -s "$OUT.tmp" ]; then
+	[ -f "$OUT" ] && cp -f "$OUT" "$OUT.bak"
+	mv -f "$OUT.tmp" "$OUT"
+	logger -t dnscat "updated $(grep -vc '^#' "$OUT") domains"
+else
+	rm -f "$OUT.tmp"
+	logger -t dnscat "update failed: no domains parsed"
+	exit 1
+fi

@@ -1,0 +1,76 @@
+#!/bin/sh
+# Send the Web Viewer's own traffic through the NordVPN WireGuard interface.
+#
+# The viewer runs as the unprivileged user "webview"; iptables marks that
+# user's packets (0x2) and a policy rule sends marked traffic to table 101.
+# Table 101 holds a default route via wgvpn *only while the tunnel has a fresh
+# handshake*. When the tunnel is down the table is emptied, so marked packets
+# fall through to the main table and leave via the WAN — fail open, never a
+# black hole.
+#
+# Usage: webview-vpn apply|status|disable
+
+VPN=wgvpn
+TABLE=101
+MARK=0x2
+MAX_AGE=180          # seconds; a handshake older than this counts as down
+USER=webview
+
+log() { logger -t webview-vpn "$*"; }
+
+vpn_age() {
+	local hs now
+	[ -d "/sys/class/net/$VPN" ] || { echo -1; return; }
+	hs=$(wg show "$VPN" latest-handshakes 2>/dev/null | awk '{print $2}' | sort -n | tail -1)
+	[ -n "$hs" ] || { echo -1; return; }
+	now=$(date +%s)
+	echo $((now - hs))
+}
+
+vpn_up() {
+	local age
+	age=$(vpn_age)
+	[ "$age" -ge 0 ] && [ "$age" -le "$MAX_AGE" ]
+}
+
+uid_of() {
+	id -u "$USER" 2>/dev/null
+}
+
+ensure_rule() {
+	ip rule show 2>/dev/null | grep -q "fwmark $MARK lookup $TABLE" ||
+		ip rule add fwmark "$MARK" lookup "$TABLE" pref 100 2>/dev/null
+}
+
+apply() {
+	ensure_rule
+	if vpn_up; then
+		ip route replace default dev "$VPN" scope link table "$TABLE" 2>/dev/null
+	else
+		ip route flush table "$TABLE" 2>/dev/null
+	fi
+}
+
+disable() {
+	ip route flush table "$TABLE" 2>/dev/null
+	ip rule del fwmark "$MARK" lookup "$TABLE" pref 100 2>/dev/null
+}
+
+status() {
+	local age state
+	age=$(vpn_age)
+	if vpn_up; then state="vpn"; else state="wan"; fi
+	echo "user=$USER"
+	echo "uid=$(uid_of)"
+	echo "vpn=$VPN"
+	echo "handshake_age=$age"
+	echo "state=$state"
+	ip route show table "$TABLE" 2>/dev/null | head -2
+}
+
+case "$1" in
+	apply) apply ;;
+	disable) disable ;;
+	status) status ;;
+	*) echo "usage: $0 apply|status|disable" >&2; exit 1 ;;
+esac

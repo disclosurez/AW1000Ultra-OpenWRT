@@ -1,0 +1,44 @@
+<%+header%>
+<%
+local sys  = require "luci.sys"
+local util = require "luci.util"
+local pcdata = util.pcdata
+
+local raw = sys.exec("logread -e '^' 2>/dev/null") or ""
+local n = 0
+for _ in raw:gmatch("[^\n]+") do n = n + 1 end
+local kb = math.floor(#raw / 1024)
+%>
+<h2 name="content"><%:System Log%></h2>
+<p class="cbi-map-descr"><%:Live system log from logd (2 MB RAM ring buffer, lost on reboot). Newest entries are at the bottom.%></p>
+
+<div style="display:flex;gap:12px;flex-wrap:wrap;margin:14px 0">
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=n%></b><br><%:lines%></div>
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=kb%> KB</b><br><%:buffered%></div>
+</div>
+
+<div class="cbi-section" style="padding:12px 16px;margin-bottom:14px">
+	<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+		<input id="log-q" type="search" placeholder="<%:Filter log lines%>" style="flex:1;min-width:260px" oninput="logFilter()" />
+		<button type="button" class="btn" onclick="awLog.downloadEl('logview','system.log')"><%:Download%></button>
+		<button type="button" class="btn" onclick="awLog.copyEl('logview', this)"><%:Copy log%></button>
+		<button type="button" class="btn" onclick="location.reload()"><%:Refresh%></button>
+	</div>
+</div>
+
+<pre id="logview" style="max-height:68vh;overflow:auto;background:#f7f7f7;border:1px solid #ddd;border-radius:6px;padding:10px;margin:0;font-size:12px;line-height:1.45;white-space:pre-wrap;word-break:break-word"><%=pcdata(raw)%></pre>
+
+<script type="text/javascript">
+var logFull = (document.getElementById('logview').textContent || '');
+
+function logFilter() {
+	var q = (document.getElementById('log-q').value || '').toLowerCase();
+	var el = document.getElementById('logview');
+	if (!q) { el.textContent = logFull; return; }
+	var lines = logFull.split('\n').filter(function (l) {
+		return l.toLowerCase().indexOf(q) !== -1;
+	});
+	el.textContent = lines.join('\n');
+}
+</script>
+<%+footer%>

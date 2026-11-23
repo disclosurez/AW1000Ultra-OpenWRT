@@ -1,0 +1,266 @@
+#!/bin/sh
+# Isolated guest Wi-Fi bridge.
+#
+#   wifi-guest prepare             create/update the guest bridge, network, DHCP and firewall
+#   wifi-guest apply <ifname> <0|1> move a VIF to br-lan (0) or br-guest (1)
+#   wifi-guest boot                prepare and re-attach every saved guest VIF
+#   wifi-guest claim <ifname>      attach a VIF only if it is in the guest list
+#   wifi-guest forget <ifname>     remove a VIF from the guest list and both bridges
+#   wifi-guest status
+#
+# The vendor wapp daemon reads the per-VIF Wapiifname profile token. The Wi-Fi
+# controller sets it to br-guest for a guest SSID; this helper keeps the
+# bridge, DHCP range and firewall zone in sync and moves the interface
+# immediately, so Save (without a full Wi-Fi restart) still takes effect.
+#
+# The bridge is created outside netifd on purpose: the vendor wapp owns the
+# Wi-Fi VIFs and netifd's bridge setup fights it. The guest DHCP range is a
+# dnsmasq conf-dir fragment, so the existing dnsmasq instance serves it and
+# the main LAN is untouched.
+
+GUEST=guest
+BR=br-guest
+IP=192.168.5.1
+NETMASK=255.255.255.0
+START=100
+LIMIT=150
+LEASETIME=12h
+DNSMASQ_DIR=/tmp/dnsmasq.d
+DNSMASQ_FILE=$DNSMASQ_DIR/wifi-guest.conf
+
+log() { logger -t wifi-guest "$*"; }
+
+list_has() {
+	case " $2 " in *" $1 "*) return 0 ;; esac
+	return 1
+}
+
+iface_list() {
+	uci -q get wifi_guest.main.ifaces 2>/dev/null || true
+}
+
+guest_enabled() {
+	[ "$(uci -q get wifi_guest.main.enabled)" = "0" ] && return 1
+	return 0
+}
+
+ensure_list_section() {
+	[ -f /etc/config/wifi_guest ] || touch /etc/config/wifi_guest
+	uci -q get wifi_guest.main >/dev/null 2>&1 || {
+		uci set wifi_guest.main=wifi_guest
+		uci commit wifi_guest
+	}
+}
+
+add_iface() {
+	local ifname="$1" list
+	[ -n "$ifname" ] || return 0
+	ensure_list_section
+	list="$(iface_list)"
+	list_has "$ifname" "$list" && return 0
+	uci add_list wifi_guest.main.ifaces="$ifname"
+	uci commit wifi_guest
+	log "saved guest VIF $ifname"
+}
+
+del_iface() {
+	local ifname="$1" list out=""
+	[ -n "$ifname" ] || return 0
+	list="$(iface_list)"
+	for x in $list; do
+		[ "$x" = "$ifname" ] || out="${out:+$out }$x"
+	done
+	[ "$out" = "$list" ] && return 0
+	uci -q delete wifi_guest.main.ifaces
+	for x in $out; do uci add_list wifi_guest.main.ifaces="$x"; done
+	uci commit wifi_guest
+	log "removed guest VIF $ifname"
+}
+
+ensure_bridge() {
+	if [ ! -d "/sys/class/net/$BR" ]; then
+		brctl addbr "$BR" >/dev/null 2>&1 || true
+		log "created bridge $BR"
+	fi
+	ifconfig "$BR" "$IP" netmask "$NETMASK" up >/dev/null 2>&1 || true
+}
+
+ensure_network() {
+	if ! uci -q get network.$GUEST >/dev/null 2>&1; then
+		uci set network.$GUEST=interface
+		log "created network.$GUEST"
+	fi
+	# Only used to map the firewall zone to br-guest; the address is on the
+	# manually created bridge, not managed by netifd.
+	uci set network.$GUEST.proto='none'
+	uci set network.$GUEST.ifname="$BR"
+	uci -q delete network.$GUEST.type
+	uci -q delete network.$GUEST.ipaddr
+	uci -q delete network.$GUEST.netmask
+	uci -q delete network.$GUEST.device
+	uci -q delete network.guest_dev
+	uci commit network
+}
+
+ensure_firewall() {
+	if ! uci -q get firewall.wifi_guest >/dev/null 2>&1; then
+		uci set firewall.wifi_guest=zone
+		uci set firewall.wifi_guest.name='wifi_guest'
+		uci set firewall.wifi_guest.input='REJECT'
+		uci set firewall.wifi_guest.output='ACCEPT'
+		uci set firewall.wifi_guest.forward='REJECT'
+		uci set firewall.wifi_guest.network="$GUEST"
+		log "created firewall zone wifi_guest"
+	fi
+	if ! uci -q get firewall.wifi_guest_wan >/dev/null 2>&1; then
+		uci set firewall.wifi_guest_wan=forwarding
+		uci set firewall.wifi_guest_wan.src='wifi_guest'
+		uci set firewall.wifi_guest_wan.dest='wan'
+	fi
+	if ! uci -q get firewall.wifi_guest_dns >/dev/null 2>&1; then
+		uci set firewall.wifi_guest_dns=rule
+		uci set firewall.wifi_guest_dns.name='Guest DNS and DHCP'
+		uci set firewall.wifi_guest_dns.src='wifi_guest'
+		uci set firewall.wifi_guest_dns.proto='tcp udp'
+		uci set firewall.wifi_guest_dns.dest_port='53 67 68'
+		uci set firewall.wifi_guest_dns.target='ACCEPT'
+	fi
+	if ! uci -q get firewall.wifi_guest_portal >/dev/null 2>&1; then
+		uci set firewall.wifi_guest_portal=rule
+		uci set firewall.wifi_guest_portal.name='Guest portal'
+		uci set firewall.wifi_guest_portal.src='wifi_guest'
+		uci set firewall.wifi_guest_portal.proto='tcp'
+		uci set firewall.wifi_guest_portal.dest_port='8088'
+		uci set firewall.wifi_guest_portal.target='ACCEPT'
+	fi
+	uci commit firewall
+}
+
+ensure_dnsmasq() {
+	local changed=0 conf
+	conf="dhcp-range=set:wifi_guest,192.168.5.$START,192.168.5.$((START + LIMIT - 1)),$NETMASK,$LEASETIME
+dhcp-option=tag:wifi_guest,3,$IP
+dhcp-option=tag:wifi_guest,6,$IP"
+
+	mkdir -p "$DNSMASQ_DIR"
+	if [ "$(cat "$DNSMASQ_FILE" 2>/dev/null)" != "$conf" ]; then
+		printf '%s\n' "$conf" > "$DNSMASQ_FILE"
+		changed=1
+	fi
+
+	if uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1; then
+		if uci -q get dhcp.@dnsmasq[0].notinterface 2>/dev/null | grep -q "br-guest"; then
+			uci -q del_list dhcp.@dnsmasq[0].notinterface='br-guest'
+			changed=1
+		fi
+	fi
+	if uci -q get dhcp.$GUEST >/dev/null 2>&1; then
+		uci -q delete dhcp.$GUEST
+		changed=1
+	fi
+	uci commit dhcp
+
+	[ "$changed" = "1" ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+}
+
+prepare() {
+	ensure_bridge
+	ensure_network
+	ensure_firewall
+	ensure_dnsmasq
+}
+
+move_if() {
+	local ifname="$1" target="$2"
+
+	[ -d "/sys/class/net/$ifname" ] || return 0
+
+	brctl delif br-lan "$ifname" >/dev/null 2>&1 || true
+	brctl delif "$BR" "$ifname" >/dev/null 2>&1 || true
+	ifconfig "$ifname" up >/dev/null 2>&1 || true
+	brctl addif "$target" "$ifname" >/dev/null 2>&1 || true
+}
+
+apply_if() {
+	local ifname="$1"
+	[ -d "/sys/class/net/$ifname" ] || return 0
+	if guest_enabled; then
+		ensure_bridge
+		move_if "$ifname" "$BR"
+	else
+		brctl delif "$BR" "$ifname" >/dev/null 2>&1 || true
+		brctl delif br-lan "$ifname" >/dev/null 2>&1 || true
+		ifconfig "$ifname" down >/dev/null 2>&1 || true
+	fi
+}
+
+apply() {
+	local ifname="$1" guest="$2"
+
+	[ -n "$ifname" ] || return 1
+	prepare
+	if [ "$guest" = "1" ]; then
+		add_iface "$ifname"
+		apply_if "$ifname"
+	else
+		del_iface "$ifname"
+		move_if "$ifname" "br-lan"
+	fi
+}
+
+reload() {
+	local ifname
+	prepare
+	for ifname in $(iface_list); do
+		apply_if "$ifname"
+	done
+}
+
+boot() {
+	local ifname
+	prepare
+	for ifname in $(iface_list); do
+		apply_if "$ifname"
+	done
+}
+
+claim() {
+	local ifname="$1"
+	[ -n "$ifname" ] || return 0
+	list_has "$ifname" "$(iface_list)" || return 0
+	apply_if "$ifname"
+}
+
+forget() {
+	local ifname="$1"
+	[ -n "$ifname" ] || return 1
+	del_iface "$ifname"
+	brctl delif "$BR" "$ifname" >/dev/null 2>&1 || true
+	brctl delif br-lan "$ifname" >/dev/null 2>&1 || true
+}
+
+status() {
+	echo "bridge: $BR"
+	brctl show "$BR" 2>/dev/null || echo "  (missing)"
+	ip -4 addr show "$BR" 2>/dev/null | grep inet || true
+	echo "guest VIFs: $(iface_list)"
+	echo "guest enabled: $(guest_enabled && echo 1 || echo 0)"
+	echo "network.$GUEST=$(uci -q get network.$GUEST 2>/dev/null || echo missing)"
+	echo "firewall.wifi_guest=$(uci -q get firewall.wifi_guest 2>/dev/null || echo missing)"
+	echo "dnsmasq fragment: $DNSMASQ_FILE"
+	[ -r "$DNSMASQ_FILE" ] && sed 's/^/  /' "$DNSMASQ_FILE"
+}
+
+case "$1" in
+	prepare) prepare ;;
+	apply)   apply "$2" "$3" ;;
+	reload)  reload ;;
+	boot)    boot ;;
+	claim)   claim "$2" ;;
+	forget)  forget "$2" ;;
+	status)  status ;;
+	*)
+		echo "usage: $0 prepare | apply <ifname> <0|1> | reload | boot | claim <ifname> | forget <ifname> | status" >&2
+		exit 1
+		;;
+esac

@@ -1,0 +1,24 @@
+# never commit credentials or device state
+*.token
+*.key
+*.pem
+*secret*
+!**/secret*.example
+
+# build artifacts
+/dist/
+/dist/cloudflared-linux-arm64
+/dist/cloudflare-ddns
+*.o
+
+# local noise
+*.png
+*.jpg
+!docs/screenshots/*.png
+!docs/screenshots/*.jpg
+*.log
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+/tmp/

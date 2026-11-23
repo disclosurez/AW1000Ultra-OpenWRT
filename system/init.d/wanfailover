@@ -1,0 +1,25 @@
+#!/bin/sh /etc/rc.common
+# wan-failover — wired WAN (eth1) preferred, 5G modem as failover.
+# The watchdog only changes route metrics; netifd still owns the interfaces.
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /bin/sh /usr/sbin/wan-failover loop
+	# restart quickly, but do not enter an hour-long crash loop if it keeps dying
+	procd_set_param respawn 120 5 10
+	procd_set_param stdout 0
+	procd_set_param stderr 0
+	procd_close_instance
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger wanfailover
+}

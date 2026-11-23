@@ -1,0 +1,187 @@
+<%+header%>
+<%
+local sys  = require "luci.sys"
+local util = require "luci.util"
+local http = require "luci.http"
+local pcdata = util.pcdata
+
+local scope = http.formvalue("scope") or "all"
+if scope ~= "lan" and scope ~= "guest" then scope = "all" end
+
+local guest_ifaces = {}
+for v in (sys.exec("uci -q get wifi_guest.main.ifaces") or ""):gmatch("%S+") do
+	guest_ifaces[v:lower()] = true
+end
+
+local function is_guest(l)
+	local s = l:lower()
+	if s:find("192.168.5.", 1, true) or s:find("br-guest", 1, true) then return true end
+	for v in pairs(guest_ifaces) do
+		if s:find(v, 1, true) then return true end
+	end
+	return false
+end
+
+local function is_lan(l)
+	local s = l:lower()
+	return s:find("192.168.0.", 1, true) or s:find("br-lan", 1, true)
+		or s:find("ra0", 1, true) or s:find("rai0", 1, true)
+		or s:find("eth0", 1, true) or s:find("rndis0", 1, true)
+end
+
+local function in_scope(l)
+	if scope == "guest" then return is_guest(l) end
+	if scope == "lan" then return is_lan(l) end
+	return true
+end
+
+local raw = sys.exec("logread 2>/dev/null | tail -n 4000") or ""
+local entries, counts = {}, {}
+local total = 0
+
+local function classify(l)
+	local s = l:lower()
+
+	if s:find("dropbear", 1, true) or s:find("crond", 1, true) then return nil end
+
+	-- Kernel lines: keep only interface / wifi link events
+	if s:find("kernel", 1, true) then
+		if s:find("wlan", 1, true) or s:find("ra0", 1, true) or
+		   s:find("rai0", 1, true) then
+			return "WiFi"
+		end
+		if s:find("link", 1, true) or s:find("carrier", 1, true) or
+		   s:find("ccmni", 1, true) or s:find("eth0", 1, true) or
+		   s:find("eth1", 1, true) or s:find("br-", 1, true) then
+			return "Interfaces"
+		end
+		return nil
+	end
+
+	if s:find("wgvpn", 1, true) or s:find("wghome", 1, true) or
+	   s:find("wireguard", 1, true) or s:find("wg-quick", 1, true) then
+		return "VPN"
+	end
+	if s:find("ptrl", 1, true) or s:find("firewall", 1, true) or
+	   s:find("reject", 1, true) or s:find("dropped", 1, true) or
+	   s:find("drop packet", 1, true) then
+		return "Firewall"
+	end
+	if s:find("hostapd", 1, true) or s:find("wpa_supplicant", 1, true) or
+	   s:find("wapp:", 1, true) or s:find("wapp[", 1, true) or
+	   s:find("wlan", 1, true) or s:find("wireless", 1, true) or
+	   s:find("ra0", 1, true) or s:find("rai0", 1, true) or
+	   s:find("apcli", 1, true) then
+		return "WiFi"
+	end
+	for v in pairs(guest_ifaces) do
+		if s:find(v, 1, true) then return "WiFi" end
+	end
+	if s:find("dnsmasq", 1, true) or s:find("odhcpd", 1, true) or
+	   s:find("dhcp", 1, true) then
+		return "DHCP/DNS"
+	end
+	if s:find("netifd", 1, true) then return "Interfaces" end
+
+	return nil
+end
+
+for line in raw:gmatch("[^\n]+") do
+	local cat = classify(line)
+	if cat and in_scope(line) then
+		local ts, msg = line:match("^(%a+%s+%a+%s+%d+%s+%d+:%d+:%d+)%s+%d+%s+(.*)$")
+		if not ts then
+			ts, msg = line:match("^(%a+%s+%d+%s+%d+:%d+:%d+)%s+(.*)$")
+		end
+		if not ts then ts, msg = "", line end
+		entries[#entries + 1] = { ts = ts, msg = msg, cat = cat }
+		counts[cat] = (counts[cat] or 0) + 1
+		total = total + 1
+	end
+end
+
+local cat_list = { "Interfaces", "DHCP/DNS", "WiFi", "Firewall", "VPN" }
+%>
+<h2 name="content"><%:Network Log%></h2>
+<p class="cbi-map-descr"><%:Interface, DHCP/DNS, WiFi, firewall and VPN events from the system log. The system log is a 2 MB RAM ring buffer and is lost on reboot.%></p>
+
+<div class="cbi-section" style="padding:10px 16px;margin:14px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+	<span class="cbi-section-descr"><%:Scope%>:</span>
+	<a class="btn <%= (scope == "all") and "btn-primary" or "" %>" href="<%=url('admin/logs/network')%>?scope=all"><%:All%></a>
+	<a class="btn <%= (scope == "lan") and "btn-primary" or "" %>" href="<%=url('admin/logs/network')%>?scope=lan"><%:LAN%></a>
+	<a class="btn <%= (scope == "guest") and "btn-primary" or "" %>" href="<%=url('admin/logs/network')%>?scope=guest"><%:Guest Wireless%></a>
+	<span class="cbi-section-descr"><%:Guest Wireless is 192.168.5.0/24 / br-guest; LAN is 192.168.0.0/24 / br-lan.%></span>
+</div>
+
+<div style="display:flex;gap:12px;flex-wrap:wrap;margin:14px 0">
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=total%></b><br><%:events%></div>
+	<% for _, c in ipairs(cat_list) do %>
+	<div class="cbi-section" style="padding:10px 16px"><b style="font-size:1.4em"><%=counts[c] or 0%></b><br><%=c%></div>
+	<% end %>
+</div>
+
+<div class="cbi-section" style="padding:12px 16px;margin-bottom:14px">
+	<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+		<input id="net-q" type="search" placeholder="<%:Filter messages%>" style="flex:1;min-width:240px" oninput="netFilter()" />
+		<span id="net-cats" style="display:flex;gap:6px;flex-wrap:wrap">
+			<button type="button" class="btn btn-primary" data-cat="all" onclick="netSetCat('all')"><%:All%></button>
+			<% for _, c in ipairs(cat_list) do %>
+			<button type="button" class="btn" data-cat="<%=c%>" onclick="netSetCat('<%=c%>')"><%=c%></button>
+			<% end %>
+		</span>
+		<button type="button" class="btn" onclick="awLog.downloadTable('net-log','network-log.csv')"><%:Download%></button>
+		<button type="button" class="btn" onclick="awLog.copyTable('net-log', this)"><%:Copy log%></button>
+		<button type="button" class="btn" onclick="location.reload()"><%:Refresh%></button>
+	</div>
+</div>
+
+<div style="max-height:620px;overflow:auto">
+<table class="cbi-section-table" id="net-log">
+	<thead><tr><th style="width:150px"><%:Time%></th><th style="width:110px"><%:Category%></th><th><%:Message%></th></tr></thead>
+	<tbody>
+	<%
+	local shown = 0
+	for i = #entries, 1, -1 do
+		local e = entries[i]
+		if shown < 600 then
+			shown = shown + 1
+	%>
+	<tr data-cat="<%=e.cat%>">
+		<td class="mono" style="white-space:nowrap;font-size:12px"><%=pcdata(e.ts)%></td>
+		<td><span style="padding:1px 6px;border:1px solid #cfd8d0;border-radius:10px;font-size:11px;white-space:nowrap"><%=e.cat%></span></td>
+		<td class="mono" style="font-size:12px;word-break:break-word"><%=pcdata(e.msg)%></td>
+	</tr>
+	<%
+		end
+	end
+	if shown == 0 then %><tr><td colspan="3"><em><%:No network events in the current log.%></em></td></tr><% end %>
+	</tbody>
+</table>
+</div>
+<% if total > shown then %>
+<p class="cbi-section-descr"><%:Showing the most recent%> <%=shown%> <%:of%> <%=total%> <%:matching events.%></p>
+<% end %>
+
+<script type="text/javascript">
+var netCat = 'all';
+
+function netSetCat(c) {
+	netCat = c;
+	var btns = document.querySelectorAll('#net-cats button');
+	for (var i = 0; i < btns.length; i++)
+		btns[i].className = 'btn' + (btns[i].getAttribute('data-cat') === c ? ' btn-primary' : '');
+	netFilter();
+}
+
+function netFilter() {
+	var q = (document.getElementById('net-q').value || '').toLowerCase();
+	var rows = document.querySelectorAll('#net-log tbody tr');
+	for (var i = 0; i < rows.length; i++) {
+		var cat = rows[i].getAttribute('data-cat') || '';
+		var txt = (rows[i].innerText || rows[i].textContent || '').toLowerCase();
+		var ok = (netCat === 'all' || cat === netCat) && (!q || txt.indexOf(q) !== -1);
+		rows[i].style.display = ok ? '' : 'none';
+	}
+}
+</script>
+<%+footer%>

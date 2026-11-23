@@ -1,0 +1,60 @@
+# Seed for /etc/config/siem — written only if the file does not exist.
+# Managed from LuCI: Services -> SIEM Forwarding.
+#
+# Events are spooled (default /tmp/siem, RAM) and delivered by
+# /usr/sbin/siem-forward. The spool is capped; when full, the OLDEST events are
+# dropped and counted. Set spool to /data/siem to survive a reboot (eMMC writes).
+
+config settings 'settings'
+	# off until an endpoint is configured, so a fresh install sends nothing
+	option enabled '0'
+
+	# syslog  = logd ring buffer (kernel, firewall, parental, services)
+	# dns     = dnsmasq query log (/data/logs/dns.log, not in syslog)
+	# portal  = guest captive-portal acceptances (richer than the syslog line)
+	option sources 'syslog dns'
+
+	option interval '5'          # seconds between flush attempts
+	option batch '200'           # events per delivery
+	option spool '/tmp/siem'     # use /data/siem to persist across reboot
+	option spool_max_kb '4096'   # 0 = uncapped (not recommended)
+	option hostname ''           # blank = /proc/sys/kernel/hostname
+	option dns_file '/data/logs/dns.log'
+	option portal_file '/data/portal/accept.log'
+
+	# 0 = stream new messages only; logread -f asks logd for lines=0, so a
+	#     collector restart does not replay the buffer
+	# 1 = dump the current 2 MB ring buffer first, then follow (duplicates on
+	#     every collector start; useful for a one-off catch-up)
+	option syslog_backfill '0'
+
+config target 'target'
+	option enabled '1'
+	option name 'siem'
+
+	# transport: syslog | http
+	option transport 'syslog'
+
+	# ---- syslog transport --------------------------------------------------
+	option host ''
+	option port '6514'
+	option proto 'tls'            # udp | tcp | tls (TLS needs openssl-util)
+	option format 'rfc5424'       # rfc5424 | rfc3164
+	option facility 'local0'
+	option framing 'auto'         # auto (octet for tcp/tls) | octet | newline
+	option tls_verify '1'
+	option ca_file ''             # extra CA bundle for a private PKI
+
+	# ---- http transport ----------------------------------------------------
+	# Splunk HEC:  https://splunk.example.com:8088/services/collector/event
+	# http_format: jsonl | array | splunk | raw
+	option url ''
+	option http_format 'jsonl'
+	option token_file '/etc/siem.token'   # mode 600, never shown in the UI
+	option auth_header 'Authorization'
+	option auth_scheme ''         # "Splunk" or "Bearer"; blank = raw token
+	option extra_header ''        # e.g. 'X-Source: aw1000'
+	option insecure '0'
+	option drop_on_4xx '1'        # a rejected payload must not block the queue
+
+	option timeout '15'

@@ -1,0 +1,95 @@
+<%#
+ AW1000 Console — sign in
+-%>
+<%
+	blank_page = true
+	local util = require "luci.util"
+	local uci  = require "luci.model.uci".cursor()
+	local ver  = require "luci.version"
+	local boardinfo = util.ubus("system", "board") or {}
+	local hostname = boardinfo.hostname or "Router"
+	local model = (boardinfo.model or "AW1000 Ultra"):gsub("_", " ")
+	local lanip = uci:get("network", "lan", "ipaddr") or "192.168.0.1"
+	local fwver = (ver.distversion or "OpenWrt"):gsub("^%s+", "")
+	local fwshort = fwver:match("^(%S+%s+%S+)") or fwver
+-%>
+<% include("themes/" .. theme .. "/header") %>
+<div class="login-grid">
+	<section class="login-aside">
+		<div class="login-aside-top">
+			<span class="brand-mark brand-mark-lg"><svg viewBox="0 0 32 32"><use href="#i-mark"/></svg></span>
+			<span class="login-host"><%=pcdata(hostname)%><small><%=pcdata(model)%></small></span>
+		</div>
+
+		<div class="login-copy">
+			<h1>Signal,<br>under control.</h1>
+			<p class="login-lede">Interfaces, VPN split routing, parental rules and live traffic for this router — one quiet console.</p>
+		</div>
+
+		<svg class="login-signal" viewBox="0 0 520 300" aria-hidden="true" focusable="false">
+			<g fill="none" stroke="currentColor" stroke-width="1.2">
+				<circle cx="34" cy="286" r="86" opacity=".55"/>
+				<circle cx="34" cy="286" r="146" opacity=".4"/>
+				<circle cx="34" cy="286" r="206" opacity=".28"/>
+				<circle cx="34" cy="286" r="266" opacity=".18"/>
+				<path d="M34 286L336 70" opacity=".35"/>
+				<path d="M120 286h360M180 246h300M240 206h240" opacity=".16"/>
+			</g>
+			<circle cx="34" cy="286" r="4.5" fill="#57D8BE"/>
+			<circle cx="230" cy="143" r="3" fill="#57D8BE" opacity=".85"/>
+		</svg>
+
+		<dl class="login-facts">
+			<div><dt>Model</dt><dd><%=pcdata(model)%></dd></div>
+			<div><dt>Firmware</dt><dd title="<%=pcdata(fwver)%>"><%=pcdata(fwshort)%></dd></div>
+			<div><dt>LAN</dt><dd class="mono"><%=pcdata(lanip)%></dd></div>
+		</dl>
+	</section>
+
+	<section class="login-panel">
+		<form class="login-form" method="post" action="<%=pcdata(FULL_REQUEST_URI)%>" autocomplete="on">
+			<h2>Sign in</h2>
+			<p class="login-sub">Use the router’s root credentials.</p>
+
+			<% if fuser then %>
+			<div class="login-error" role="alert">
+				<svg class="icon" viewBox="0 0 24 24"><use href="#i-alert"/></svg>
+				<span>That username and password did not match. Try again.</span>
+			</div>
+			<% end %>
+
+			<label class="field">
+				<span class="field-label">Username</span>
+				<input type="text" name="luci_username" id="luci_username" value="<%=pcdata(duser or 'root')%>" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+			</label>
+
+			<label class="field">
+				<span class="field-label">Password</span>
+				<span class="field-pass">
+					<input type="password" name="luci_password" id="luci_password" autocomplete="current-password" required>
+					<button type="button" class="pw-toggle" id="pw-toggle" aria-label="Show password" aria-pressed="false">Show</button>
+				</span>
+			</label>
+
+			<button type="submit" class="btn btn-primary btn-block">Sign in</button>
+
+			<p class="login-note">
+				<svg class="icon" viewBox="0 0 24 24"><use href="#i-shield"/></svg>
+				<span>This console is reachable only from the local network.</span>
+			</p>
+		</form>
+
+		<div class="login-foot">
+			<span class="mono"><%=pcdata(lanip)%></span>
+			<span>·</span>
+			<span><%=pcdata(hostname)%></span>
+		</div>
+	</section>
+</div>
+<script>
+(function(){
+	var u=document.getElementById('luci_username'), p=document.getElementById('luci_password');
+	if (u && p) (u.value ? p : u).focus();
+})();
+</script>
+<% include("themes/" .. theme .. "/footer") %>

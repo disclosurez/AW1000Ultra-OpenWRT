@@ -1,0 +1,3 @@
+# Guest Wi-Fi VIF list and on/off state. Managed by /usr/sbin/wifi-guest.
+config wifi_guest 'main'
+	option enabled '1'

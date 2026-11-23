@@ -1,0 +1,163 @@
+<%#
+ AW1000 Console — LuCI theme
+ Graphite chassis / bone canvas. See DESIGN.md.
+-%>
+<%
+	local sys  = require "luci.sys"
+	local util = require "luci.util"
+	local http = require "luci.http"
+	local disp = require "luci.dispatcher"
+	local uci  = require "luci.model.uci".cursor()
+	local conf = require "luci.config"
+	local ver  = require "luci.version"
+
+	local bootstrap = conf.themes.Bootstrap or "/luci-static/bootstrap"
+
+	local boardinfo = util.ubus("system", "board") or {}
+	local hostname  = boardinfo.hostname or "Router"
+	local model     = boardinfo.model or "AW1000 Ultra"
+	local node      = disp.context.dispatched
+	local lanip     = uci:get("network", "lan", "ipaddr") or "192.168.0.1"
+	local fwver     = (ver.distversion or "OpenWrt"):gsub("^%s+", "")
+	local fwshort   = fwver:match("^(%S+%s+%S+)") or fwver
+	local node_title = node and node.title and translate(node.title) or ""
+	node_title = node_title:gsub("&#(%d+);", function(n) return string.char(tonumber(n)) end)
+	-- 3ginfo-lite labels the SIM uplink as a generic modem.
+	local node_name = node and node.name or ""
+	if node_name == "modem" or node_name == "3ginfo-lite" or
+	   node_title == "Information about 3G/4G/5G connection" then
+		node_title = "Sim Modem"
+	end
+	if blank_page then node_title = "Sign in" end
+
+	http.prepare_content("text/html; charset=UTF-8")
+-%>
+<!DOCTYPE html>
+<html lang="<%=luci.i18n.context.lang%>">
+<head>
+	<meta charset="utf-8">
+	<title><%=striptags(hostname .. (node_title ~= "" and (" · " .. node_title) or ""))%></title>
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<meta name="color-scheme" content="light">
+	<meta name="theme-color" content="#0E1412">
+	<link rel="icon" href="<%=media%>/favicon.svg" type="image/svg+xml">
+	<link rel="preload" href="<%=media%>/fonts/plexsans.woff2" as="font" type="font/woff2" crossorigin>
+	<link rel="stylesheet" href="<%=bootstrap%>/cascade.css">
+	<link rel="stylesheet" href="<%=media%>/cascade.css?v=console-8">
+	<% if node and node.css then %>
+	<link rel="stylesheet" href="<%=resource%>/<%=node.css%>">
+	<% end -%>
+	<% if css then %><style><%= css %></style><% end -%>
+	<script>try{if(localStorage.getItem("aw1000.rail")==="collapsed")document.documentElement.className+=" rail-collapsed";}catch(e){}</script>
+	<script src="<%=url('admin/translations', luci.i18n.context.lang)%>"></script>
+	<script src="<%=resource%>/cbi.js"></script>
+</head>
+
+<body class="lang_<%=luci.i18n.context.lang%> <%=node and striptags(node.title) or ''%><%=blank_page and ' is-login' or ''%>" data-page="<%=pcdata(table.concat(disp.context.requestpath, '-'))%>">
+
+<a class="skip-link" href="#maincontent">Skip to content</a>
+
+<svg class="sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+	<symbol id="i-mark" viewBox="0 0 32 32">
+		<rect x="2.2" y="2.2" width="27.6" height="27.6" rx="8.6" fill="none" stroke="currentColor" stroke-width="1.5"/>
+		<path d="M9 21.5v-4.2M13.7 21.5v-7.4M18.3 21.5V10.9M23 21.5V8" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/>
+	</symbol>
+	<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4.2 17.5a8.5 8.5 0 1 1 15.6 0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M12 14.8l3.4-4.1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="12" cy="15.4" r="1.5" fill="currentColor"/></symbol>
+	<symbol id="i-network" viewBox="0 0 24 24"><rect x="3.2" y="3.2" width="6.4" height="6.4" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="14.4" y="14.4" width="6.4" height="6.4" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="3.2" y="14.4" width="6.4" height="6.4" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9.6 6.4h4.2a3.6 3.6 0 0 1 3.6 3.6v4.4M6.4 9.6v4.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+	<symbol id="i-wifi" viewBox="0 0 24 24"><path d="M3.4 9.3a13 13 0 0 1 17.2 0M6.5 12.7a8.2 8.2 0 0 1 11 0M9.7 16.1a3.6 3.6 0 0 1 4.6 0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="12" cy="19.2" r="1.35" fill="currentColor"/></symbol>
+	<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+	<symbol id="i-signal" viewBox="0 0 24 24"><path d="M6.8 19V14M11 19V9.5M15.2 19V5.5M19.4 19V11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+	<symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 12h2M10 12h10M4 17h7M15 17h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="16" cy="7" r="1.9" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="8" cy="12" r="1.9" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="13" cy="17" r="1.9" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+	<symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 19.5V4.5M4 19.5h16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M7.5 16v-4.5M11.5 16V8M15.5 16v-6.5M19.5 16V5.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+	<symbol id="i-log" viewBox="0 0 24 24"><rect x="5" y="3.5" width="14" height="17" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8.5 8.2h7M8.5 12h7M8.5 15.8h4.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+	<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3.4l7 2.6v5.4c0 4.3-2.9 7.5-7 9.2-4.1-1.7-7-4.9-7-9.2V6z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M8.9 12l2.2 2.2 4-4.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+	<symbol id="i-devices" viewBox="0 0 24 24"><rect x="3" y="4.5" width="12.5" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M6.5 17h6M9.2 13.5V17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><rect x="16.5" y="8" width="4.5" height="10.5" rx="1.3" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+	<symbol id="i-tools" viewBox="0 0 24 24"><path d="M14.6 3.4a4.6 4.6 0 0 0-5.9 5.9L3.8 14.2a2.2 2.2 0 0 0 0 3.1l2.9 2.9a2.2 2.2 0 0 0 3.1 0l4.9-4.9a4.6 4.6 0 0 0 5.9-5.9l-2.9 2.9-2.3-.6-.6-2.3z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></symbol>
+	<symbol id="i-theme" viewBox="0 0 24 24"><path d="M12 3a9 9 0 0 0 0 18c.9 0 1.5-.7 1.5-1.5 0-.4-.2-.8-.4-1-.3-.3-.4-.6-.4-1 0-.9.7-1.5 1.5-1.5H16a5 5 0 0 0 5-5c0-4.4-4-8-9-8z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="7.5" cy="11" r="1.1" fill="currentColor"/><circle cx="10.5" cy="7.5" r="1.1" fill="currentColor"/><circle cx="14.5" cy="7.5" r="1.1" fill="currentColor"/></symbol>
+	<symbol id="i-chevron" viewBox="0 0 24 24"><path d="M8.5 10l3.5 3.7 3.5-3.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+	<symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6.5h16M4 12h16M4 17.5h16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+	<symbol id="i-collapse" viewBox="0 0 24 24"><path d="M14.5 7.5L10 12l4.5 4.5M19 7.5L14.5 12l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M4.5 5.5v13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+	<symbol id="i-logout" viewBox="0 0 24 24"><path d="M14.5 8V5.6c0-.6-.5-1.1-1.1-1.1H5.6c-.6 0-1.1.5-1.1 1.1v12.8c0 .6.5 1.1 1.1 1.1h7.8c.6 0 1.1-.5 1.1-1.1V16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M10.5 12h9M16.5 8.8L19.8 12l-3.3 3.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+	<symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M15.5 8.5v-2a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+	<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.8v4.4h-4.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+	<symbol id="i-arrow" viewBox="0 0 24 24"><path d="M7 17L17 7M9.2 7H17v7.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+	<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5.5v13M5.5 12h13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+	<symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.6l9 15.8H3z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 9v4.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="16.4" r="1" fill="currentColor"/></symbol>
+</svg>
+
+<% if blank_page then %>
+<div class="login-shell" id="login-shell">
+<% else %>
+<div class="app" id="app">
+	<aside class="rail" id="rail">
+		<div class="rail-head">
+			<a class="brand" href="<%=url('admin/status/overview')%>" aria-label="<%=pcdata(hostname)%> overview">
+				<span class="brand-mark"><svg viewBox="0 0 32 32"><use href="#i-mark"/></svg></span>
+				<span class="brand-text">
+					<b><%=pcdata(hostname)%></b>
+					<small><%=pcdata(model:gsub("_", " "))%></small>
+				</span>
+			</a>
+			<button class="rail-toggle" id="rail-toggle" type="button" aria-label="Collapse sidebar" title="Collapse sidebar">
+				<svg viewBox="0 0 24 24"><use href="#i-collapse"/></svg>
+			</button>
+		</div>
+
+		<nav class="rail-nav" id="rail-nav" aria-label="Main navigation">
+			<ul class="menu" id="topmenu" style="display:none"></ul>
+		</nav>
+
+		<div class="rail-foot">
+			<div class="rail-lan"><span class="dot dot-ok"></span><span class="mono"><%=pcdata(lanip)%></span><span>LAN</span></div>
+			<div class="rail-meta" title="<%=pcdata(fwver)%>"><%=pcdata(fwshort)%></div>
+		</div>
+	</aside>
+
+	<div class="shell">
+		<div class="topbar">
+			<button class="nav-toggle" id="nav-toggle" type="button" aria-label="Open menu" aria-controls="rail" aria-expanded="false">
+				<svg viewBox="0 0 24 24"><use href="#i-menu"/></svg>
+			</button>
+
+			<nav class="crumb" id="crumb" aria-label="Breadcrumb"></nav>
+
+			<div class="topbar-right">
+				<a class="wan-chip" id="wan-chip" href="<%=url('admin/status/overview')%>" data-state="loading" title="WAN status">
+					<span class="dot"></span>
+					<span class="wan-label">Checking…</span>
+					<span class="wan-ip mono"></span>
+				</a>
+				<div id="indicators" class="indicators"></div>
+				<a class="btn btn-ghost btn-theme" href="<%=url('admin/system/theme')%>" title="<%:Switch theme%>">
+					<svg class="icon" viewBox="0 0 24 24"><use href="#i-theme"/></svg>
+					<span><%:Theme%></span>
+				</a>
+				<a class="btn btn-ghost btn-logout" href="<%=url('admin/logout')%>">
+					<svg class="icon" viewBox="0 0 24 24"><use href="#i-logout"/></svg>
+					<span>Log out</span>
+				</a>
+			</div>
+		</div>
+
+		<main class="canvas" id="canvas">
+			<%- if luci.sys.process.info("uid") == 0 and luci.sys.user.getuser("root") and not luci.sys.user.getpasswd("root") then -%>
+			<div class="alert-message warning">
+				<div>
+					<h4>No password set</h4>
+					<p>Anyone who can reach this router can sign in. Set a root password now.</p>
+				</div>
+				<% if disp.lookup("admin/system/admin") then %>
+				<a class="btn" href="<%=url("admin/system/admin")%>">Set password</a>
+				<% end %>
+			</div>
+			<%- end -%>
+
+			<noscript>
+				<div class="alert-message error">
+					<div><h4>JavaScript is required</h4><p>This console cannot load pages or menus without it.</p></div>
+				</div>
+			</noscript>
+
+			<div id="tabmenu" style="display:none"></div>
+			<div id="maincontent" tabindex="-1">
+<% end %>

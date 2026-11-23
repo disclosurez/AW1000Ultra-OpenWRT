@@ -1,0 +1,456 @@
+<%+header%>
+<%
+local uci = require "luci.model.uci".cursor()
+local fs  = require "nixio.fs"
+
+local shares = {}
+uci:foreach("fileshares", "share", function(s)
+	if s.host and s.share then
+		shares[#shares + 1] = {
+			id = s[".name"],
+			label = (s.label and s.label ~= "" and s.label) or s.share,
+			host = s.host,
+			share = s.share,
+			port = s.port or "445",
+			user = s.user or "",
+			domain = s.domain or "",
+			guest = ((s.guest or "0") == "1")
+		}
+	end
+end)
+
+local secrets = fs.readfile("/etc/fileshares.secrets") or ""
+local has_pw = {}
+for line in secrets:gmatch("[^\n]+") do
+	local k, v = line:match("^([^=]+)=(.*)$")
+	if k then has_pw[k] = (v ~= "") end
+end
+
+local has_smb = fs.access("/usr/bin/smbclient") or fs.access("/usr/sbin/smbclient")
+local saved = luci.http.formvalue("saved")
+local failed = luci.http.formvalue("error")
+
+local list_url  = url("admin/tools/fileshares/list")
+local up_url    = url("admin/tools/fileshares/upload")
+local down_url  = url("admin/tools/fileshares/download")
+local mkdir_url = url("admin/tools/fileshares/mkdir")
+local del_url   = url("admin/tools/fileshares/delete")
+local test_url  = url("admin/tools/fileshares/test")
+local save_url  = url("admin/tools/fileshares/save")
+local status_url = url("admin/tools/fileshares/status")
+%>
+
+<script type="text/javascript">
+//<![CDATA[
+var fsListUrl = '<%=list_url%>', fsUpUrl = '<%=up_url%>', fsDownUrl = '<%=down_url%>';
+var fsMkdirUrl = '<%=mkdir_url%>', fsDelUrl = '<%=del_url%>', fsTestUrl = '<%=test_url%>';
+var fsStatusUrl = '<%=status_url%>';
+var fsToken = '<%=token%>';
+var lsListUrl = '<%=url("admin/tools/fileshares/local_list")%>';
+var lsUpUrl = '<%=url("admin/tools/fileshares/local_upload")%>';
+var lsDownUrl = '<%=url("admin/tools/fileshares/local_download")%>';
+var lsDelUrl = '<%=url("admin/tools/fileshares/local_delete")%>';
+var fsCur = { id: '', path: '/' };
+
+function fsEsc(s) {
+	var d = document.createElement('div');
+	d.textContent = s === undefined || s === null ? '' : String(s);
+	return d.innerHTML;
+}
+
+function fsSize(n) {
+	n = Number(n || 0);
+	if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GB';
+	if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+	if (n >= 1024) return (n / 1024).toFixed(1) + ' kB';
+	return n + ' B';
+}
+
+function fsPost(url, body) {
+	return fetch(url, {
+		method: 'POST', credentials: 'same-origin',
+		headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+		body: body
+	}).then(function (r) { return r.json(); });
+}
+
+function fsJoin(path, name) {
+	if (!path || path === '/') return '/' + name;
+	return path.replace(/\/+$/, '') + '/' + name;
+}
+
+function fsParent(path) {
+	if (!path || path === '/' || path === '') return '/';
+	var p = path.replace(/\/+$/, '');
+	p = p.replace(/\/[^\/]+$/, '');
+	return p === '' ? '/' : p;
+}
+
+function fsRenderCrumbs(path) {
+	var parts = (path || '/').split('/').filter(function (x) { return x !== ''; });
+	var html = '<a href="#" data-path="/">/</a>';
+	var acc = '';
+	for (var i = 0; i < parts.length; i++) {
+		acc += '/' + parts[i];
+		html += ' / <a href="#" data-path="' + fsEsc(acc) + '">' + fsEsc(parts[i]) + '</a>';
+	}
+	var el = document.getElementById('fs-crumbs');
+	if (el) {
+		el.innerHTML = html;
+		var links = el.querySelectorAll('a');
+		for (var j = 0; j < links.length; j++) {
+			links[j].onclick = function (ev) { ev.preventDefault(); fsList(fsCur.id, this.getAttribute('data-path')); };
+		}
+	}
+}
+
+function fsRender(data) {
+	var body = document.getElementById('fs-rows');
+	if (!body) return;
+	fsCur.path = data.path || fsCur.path;
+	fsRenderCrumbs(fsCur.path);
+	if (!data.ok) {
+		body.innerHTML = '<tr><td colspan="4" class="fs-empty">' + fsEsc(data.error || 'Cannot list this folder.') +
+			(data.detail ? '<br><span class="fs-detail">' + fsEsc(data.detail) + '</span>' : '') + '</td></tr>';
+		return;
+	}
+	if (!data.entries || !data.entries.length) {
+		body.innerHTML = '<tr><td colspan="4" class="fs-empty">This folder is empty.</td></tr>';
+		return;
+	}
+	var html = '';
+	for (var i = 0; i < data.entries.length; i++) {
+		var e = data.entries[i];
+		var full = fsJoin(fsCur.path, e.name);
+		html += '<tr>';
+		html += '<td class="fs-name">' + (e.dir
+			? '<a href="#" data-open="' + fsEsc(full) + '">' + fsEsc(e.name) + '/</a>'
+			: '<span class="mono">' + fsEsc(e.name) + '</span>') + '</td>';
+		html += '<td class="fs-size mono right">' + (e.dir ? '—' : fsSize(e.size)) + '</td>';
+		html += '<td class="fs-date">' + fsEsc(e.mtime || '') + '</td>';
+		html += '<td class="fs-actions">';
+		if (!e.dir) {
+			html += '<a class="btn" href="' + fsDownUrl + '?id=' + encodeURIComponent(fsCur.id) + '&path=' + encodeURIComponent(fsCur.path) + '&name=' + encodeURIComponent(e.name) + '">Download</a> ';
+		}
+		html += '<button type="button" class="btn fs-del" data-name="' + fsEsc(e.name) + '" data-dir="' + (e.dir ? 1 : 0) + '">Delete</button>';
+		html += '</td></tr>';
+	}
+	body.innerHTML = html;
+	var opens = body.querySelectorAll('a[data-open]');
+	for (var k = 0; k < opens.length; k++) {
+		opens[k].onclick = function (ev) { ev.preventDefault(); fsList(fsCur.id, this.getAttribute('data-open')); };
+	}
+	var dels = body.querySelectorAll('.fs-del');
+	for (var d = 0; d < dels.length; d++) {
+		dels[d].onclick = function () {
+			var name = this.getAttribute('data-name');
+			if (!window.confirm('Delete "' + name + '" from the share?')) return;
+			var self = this;
+			self.disabled = true;
+			fsPost(fsDelUrl, 'token=' + encodeURIComponent(fsToken) + '&id=' + encodeURIComponent(fsCur.id) +
+				'&path=' + encodeURIComponent(fsCur.path) + '&name=' + encodeURIComponent(name) +
+				'&dir=' + this.getAttribute('data-dir'))
+				.then(function (r) { if (!r.ok) alert(r.output || 'Delete failed'); fsList(fsCur.id, fsCur.path); })
+				.catch(function () { self.disabled = false; });
+		};
+	}
+}
+
+function fsList(id, path) {
+	fsCur.id = id;
+	var panel = document.getElementById('fs-panel');
+	if (panel) panel.hidden = false;
+	var t = document.getElementById('fs-title');
+	if (t) t.textContent = 'Browsing: ' + id;
+	var body = document.getElementById('fs-rows');
+	if (body) body.innerHTML = '<tr><td colspan="4" class="fs-empty">Loading…</td></tr>';
+	fsPost(fsListUrl, 'token=' + encodeURIComponent(fsToken) + '&id=' + encodeURIComponent(id) +
+		'&path=' + encodeURIComponent(path || '/'))
+		.then(fsRender)
+		.catch(function () { if (body) body.innerHTML = '<tr><td colspan="4" class="fs-empty">Request failed.</td></tr>'; });
+}
+
+function fsUpload() {
+	var input = document.getElementById('fs-file');
+	if (!input || !input.files || !input.files.length) return;
+	if (!fsCur.id) return;
+	var f = input.files[0];
+	var out = document.getElementById('fs-upload-out');
+	if (out) out.textContent = 'Uploading ' + f.name + ' (' + fsSize(f.size) + ')…';
+	input.disabled = true;
+	var url = fsUpUrl + '?token=' + encodeURIComponent(fsToken) + '&id=' + encodeURIComponent(fsCur.id) +
+		'&path=' + encodeURIComponent(fsCur.path) + '&name=' + encodeURIComponent(f.name);
+	var fd = new FormData();
+	fd.append('file', f, f.name);
+	fetch(url, { method: 'POST', credentials: 'same-origin', body: fd })
+		.then(function (r) { return r.json(); })
+		.then(function (r) {
+			input.disabled = false;
+			input.value = '';
+			if (out) out.textContent = r.ok ? 'Uploaded ' + f.name : 'Upload failed: ' + (r.error || r.output || '');
+			if (r.ok) fsList(fsCur.id, fsCur.path);
+		})
+		.catch(function () { input.disabled = false; if (out) out.textContent = 'Upload failed.'; });
+}
+
+function fsMkdir() {
+	var name = window.prompt('New folder name');
+	if (!name) return;
+	fsPost(fsMkdirUrl, 'token=' + encodeURIComponent(fsToken) + '&id=' + encodeURIComponent(fsCur.id) +
+		'&path=' + encodeURIComponent(fsCur.path) + '&name=' + encodeURIComponent(name))
+		.then(function (r) { if (!r.ok) alert(r.output || 'Could not create the folder'); fsList(fsCur.id, fsCur.path); });
+}
+
+function fsTest(id, btn) {
+	btn.disabled = true;
+	fsPost(fsTestUrl, 'token=' + encodeURIComponent(fsToken) + '&id=' + encodeURIComponent(id))
+		.then(function (r) {
+			btn.disabled = false;
+			if (r.ok) {
+				alert('Connection OK.\n\n' + (r.output || ''));
+			} else {
+				alert('Connection failed.\n\n' + (r.error || 'Unknown error') +
+					(r.output ? '\n\n' + r.output : ''));
+			}
+		}).catch(function () { btn.disabled = false; });
+}
+
+var lsListUrl, lsUpUrl;
+
+function lsSize(n) {
+	n = Number(n || 0);
+	if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GB';
+	if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+	if (n >= 1024) return (n / 1024).toFixed(1) + ' kB';
+	return n + ' B';
+}
+
+function lsRender(d) {
+	var body = document.getElementById('ls-rows');
+	var usage = document.getElementById('ls-usage');
+	if (!body) return;
+	if (usage && d) usage.textContent = lsSize(d.used) + ' of 1 GB used';
+	if (!d || !d.ok) { body.innerHTML = '<tr><td colspan="4" class="fs-empty">Cannot read router storage.</td></tr>'; return; }
+	if (!d.entries.length) { body.innerHTML = '<tr><td colspan="4" class="fs-empty">No files on the router yet.</td></tr>'; return; }
+	var html = '';
+	for (var i = 0; i < d.entries.length; i++) {
+		var e = d.entries[i];
+		html += '<tr><td class="mono">' + fsEsc(e.name) + '</td>' +
+			'<td class="mono right">' + lsSize(e.size) + '</td>' +
+			'<td>' + fsEsc(e.mtime) + '</td>' +
+			'<td class="fs-actions">' +
+			'<a class="btn" href="' + lsDownUrl + '?name=' + encodeURIComponent(e.name) + '">Download</a> ' +
+			'<button type="button" class="btn ls-del" data-name="' + fsEsc(e.name) + '">Delete</button>' +
+			'</td></tr>';
+	}
+	body.innerHTML = html;
+	var dels = body.querySelectorAll('.ls-del');
+	for (var k = 0; k < dels.length; k++) {
+		dels[k].onclick = function () {
+			var name = this.getAttribute('data-name');
+			if (!window.confirm('Delete "' + name + '" from the router?')) return;
+			fetch(lsDelUrl, { method: 'POST', credentials: 'same-origin',
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+				body: 'token=' + encodeURIComponent(fsToken) + '&name=' + encodeURIComponent(name) })
+				.then(function (r) { return r.json(); })
+				.then(function (r) { if (!r.ok) alert(r.error || 'Delete failed'); lsRefresh(); });
+		};
+	}
+}
+
+function lsRefresh() {
+	fetch(lsListUrl, { method: 'POST', credentials: 'same-origin',
+		headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+		body: 'token=' + encodeURIComponent(fsToken) })
+		.then(function (r) { return r.json(); })
+		.then(lsRender).catch(function () {});
+}
+
+function lsUpload() {
+	var input = document.getElementById('ls-file');
+	if (!input || !input.files || !input.files.length) return;
+	var f = input.files[0], out = document.getElementById('ls-out');
+	if (f.size > 104857600) { if (out) out.textContent = 'That file is larger than 100 MB.'; return; }
+	if (out) out.textContent = 'Uploading ' + f.name + ' (' + lsSize(f.size) + ')…';
+	var fd = new FormData();
+	fd.append('file', f, f.name);
+	input.disabled = true;
+	fetch(lsUpUrl + '?token=' + encodeURIComponent(fsToken) + '&name=' + encodeURIComponent(f.name),
+		{ method: 'POST', credentials: 'same-origin', body: fd })
+		.then(function (r) { return r.json(); })
+		.then(function (r) {
+			input.disabled = false; input.value = '';
+			if (out) out.textContent = r.ok ? 'Stored ' + r.name + ' (' + lsSize(r.size) + ')' : ('Upload failed: ' + (r.error || ''));
+			if (r.ok) lsRefresh();
+		}).catch(function () { input.disabled = false; if (out) out.textContent = 'Upload failed.'; });
+}
+
+function fsPoll() {
+	if (!window.fetch) return;
+	fetch(fsStatusUrl, { credentials: 'same-origin', cache: 'no-store' })
+		.then(function (r) { return r.json(); })
+		.then(function (d) {
+			var el = document.getElementById('fs-smb');
+			if (el && d) el.textContent = d.smbclient ? 'smbclient available' : 'smbclient missing — install samba4-client';
+		}).catch(function () {});
+}
+
+if (document.addEventListener) {
+	document.addEventListener('DOMContentLoaded', function () { fsPoll(); lsRefresh(); });
+}
+//]]>
+</script>
+
+<h2 name="content"><%:File Shares%></h2>
+<p class="cbi-map-descr">
+	<%:Browse SMB/CIFS shares from other machines on the LAN and upload or download files without mounting anything. Transfers go through smbclient as root; nothing is written to flash. Passwords are kept in /etc/fileshares.secrets (0600).%>
+</p>
+
+<% if saved then %>
+<div class="alert-message success"><div><h4><%:Saved%></h4><p><%:The share list was updated.%></p></div></div>
+<% end %>
+<% if failed then %>
+<div class="alert-message error"><div><h4><%:Not saved%></h4><p><%:Host and share name are required (address may contain letters, digits, dots, dashes and colons).%></p></div></div>
+<% end %>
+<% if not has_smb then %>
+<div class="alert-message warning"><div><h4><%:smbclient is missing%></h4><p><%:Install samba4-client on the router:%> <code>opkg install samba4-client</code></p></div></div>
+<% end %>
+
+<div class="cbi-section">
+	<div class="fs-toolbar">
+		<h3><%:Shares%></h3>
+		<span class="cbi-value-description" id="fs-smb">—</span>
+	</div>
+	<div class="fs-scroll">
+	<table class="cbi-section-table fs-table">
+		<thead><tr>
+			<th><%:Name%></th><th><%:Server / share%></th><th><%:User%></th><th><%:Actions%></th>
+		</tr></thead>
+		<tbody>
+		<% if #shares == 0 then %>
+			<tr><td colspan="4" class="fs-empty"><%:No shares yet. Add one below.%></td></tr>
+		<% end %>
+		<% for _, s in ipairs(shares) do %>
+			<tr>
+				<td><strong><%=pcdata(s.label)%></strong></td>
+				<td class="mono"><%=pcdata(s.host)%>:<%=pcdata(s.port)%> / <%=pcdata(s.share)%></td>
+				<td><%= s.guest and 'guest' or pcdata(s.user ~= "" and s.user or '—') %></td>
+				<td class="fs-actions">
+					<button class="btn" type="button" onclick="fsList('<%=s.id%>', '/')"><%:Browse%></button>
+					<button class="btn" type="button" onclick="fsTest('<%=s.id%>', this)"><%:Test%></button>
+					<details style="display:inline-block;vertical-align:middle">
+						<summary class="btn" style="cursor:pointer"><%:Edit%></summary>
+						<form method="post" action="<%=save_url%>" class="fs-edit">
+							<input type="hidden" name="token" value="<%=token%>" />
+							<input type="hidden" name="id" value="<%=s.id%>" />
+							<label><%:Name%> <input type="text" name="label" value="<%=pcdata(s.label)%>" /></label>
+							<label><%:Host%> <input type="text" name="host" value="<%=pcdata(s.host)%>" /></label>
+							<label><%:Share%> <input type="text" name="share" value="<%=pcdata(s.share)%>" /></label>
+							<label><%:Port%> <input type="text" name="port" value="<%=pcdata(s.port)%>" size="6" /></label>
+							<label><%:User%> <input type="text" name="user" value="<%=pcdata(s.user)%>" size="12" /></label>
+							<label><%:Password%> <input type="password" name="password" value="" placeholder="<%:blank = keep%>" size="14" /></label>
+							<label><%:Domain%> <input type="text" name="domain" value="<%=pcdata(s.domain)%>" size="10" /></label>
+							<label><input type="checkbox" name="guest" value="1" <%= s.guest and 'checked' or '' %>/> <%:guest%></label>
+							<button class="btn cbi-button-apply" type="submit"><%:Save%></button>
+							<button class="btn" type="submit" name="op" value="delete" onclick="return confirm('Remove this share from the list?')"><%:Remove%></button>
+						</form>
+					</details>
+				</td>
+			</tr>
+		<% end %>
+		</tbody>
+	</table>
+	</div>
+</div>
+
+<div class="cbi-section">
+	<div class="fs-toolbar">
+		<h3><%:Router storage%></h3>
+		<div class="fs-tools">
+			<span class="cbi-value-description" id="ls-usage">—</span>
+			<button class="btn" type="button" onclick="lsRefresh()"><%:Refresh%></button>
+		</div>
+	</div>
+	<p class="cbi-section-descr"><%:Files kept on the router itself: 1 GB total, 100 MB per file. Any device on the LAN can download them from this page — handy as a quick drop box or to move files between machines.%></p>
+	<div class="fs-scroll">
+	<table class="cbi-section-table fs-table">
+		<thead><tr><th><%:Name%></th><th class="right"><%:Size%></th><th><%:Modified%></th><th><%:Actions%></th></tr></thead>
+		<tbody id="ls-rows"><tr><td colspan="4" class="fs-empty"><%:Loading…%></td></tr></tbody>
+	</table>
+	</div>
+	<div class="fs-upload">
+		<input type="file" id="ls-file" />
+		<button class="btn cbi-button-apply" type="button" onclick="lsUpload()"><%:Upload to router%></button>
+		<span class="cbi-value-description" id="ls-out"><%:Up to 100 MB per file.%></span>
+	</div>
+</div>
+
+<div class="cbi-section" id="fs-panel" hidden>
+	<div class="fs-toolbar">
+		<h3 id="fs-title"><%:Browse%></h3>
+		<div class="fs-tools">
+			<button class="btn" type="button" onclick="fsList(fsCur.id, fsParent(fsCur.path))"><%:Up%></button>
+			<button class="btn" type="button" onclick="fsList(fsCur.id, fsCur.path)"><%:Refresh%></button>
+			<button class="btn" type="button" onclick="fsMkdir()"><%:New folder%></button>
+		</div>
+	</div>
+	<div class="fs-crumbs mono" id="fs-crumbs">/</div>
+	<div class="fs-scroll">
+	<table class="cbi-section-table fs-table">
+		<thead><tr><th><%:Name%></th><th class="right"><%:Size%></th><th><%:Modified%></th><th><%:Actions%></th></tr></thead>
+		<tbody id="fs-rows"><tr><td colspan="4" class="fs-empty"><%:Choose Browse on a share.%></td></tr></tbody>
+	</table>
+	</div>
+	<div class="fs-upload">
+		<input type="file" id="fs-file" />
+		<button class="btn cbi-button-apply" type="button" onclick="fsUpload()"><%:Upload%></button>
+		<span class="cbi-value-description" id="fs-upload-out"><%:Uploads land in the folder shown above (100 MB limit).%></span>
+	</div>
+</div>
+
+<div class="cbi-section">
+	<h3><%:Add a share%></h3>
+	<form method="post" action="<%=save_url%>">
+		<input type="hidden" name="token" value="<%=token%>" />
+		<input type="hidden" name="id" value="" />
+		<div class="cbi-value"><label class="cbi-value-title"><%:Name%></label>
+			<div class="cbi-value-field"><input type="text" name="label" value="" placeholder="<%=pcdata('NAS')%>" /></div></div>
+		<div class="cbi-value"><label class="cbi-value-title"><%:Host%></label>
+			<div class="cbi-value-field"><input type="text" name="host" value="" placeholder="192.168.0.10" />
+				<div class="cbi-value-description"><%:IP address or hostname of the SMB server.%></div></div></div>
+		<div class="cbi-value"><label class="cbi-value-title"><%:Share%></label>
+			<div class="cbi-value-field"><input type="text" name="share" value="" placeholder="media" /></div></div>
+		<div class="cbi-value"><label class="cbi-value-title"><%:Port%></label>
+			<div class="cbi-value-field"><input type="text" name="port" value="445" size="6" /></div></div>
+		<div class="cbi-value"><label class="cbi-value-title"><%:User%></label>
+			<div class="cbi-value-field"><input type="text" name="user" value="" size="14" /></div></div>
+		<div class="cbi-value"><label class="cbi-value-title"><%:Password%></label>
+			<div class="cbi-value-field"><input type="password" name="password" value="" size="18" />
+				<div class="cbi-value-description"><%:The SMB password — separate from the router's or the server's SSH login. On a Samba server it is set with%> <code>smbpasswd -a &lt;user&gt;</code>. <%:Stored in /etc/fileshares.secrets (0600), never in the UCI config.%></div></div></div>
+		<div class="cbi-value"><label class="cbi-value-title"><%:Domain%></label>
+			<div class="cbi-value-field"><input type="text" name="domain" value="WORKGROUP" size="12" /></div></div>
+		<div class="cbi-value"><label class="cbi-value-title"><%:Guest%></label>
+			<div class="cbi-value-field"><input type="checkbox" name="guest" value="1" /> <%:connect without credentials%></div></div>
+		<div class="cbi-page-actions">
+			<button class="btn cbi-button cbi-button-apply" type="submit"><%:Add share%></button>
+		</div>
+	</form>
+</div>
+
+<style type="text/css">
+.fs-toolbar { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin: 0 0 10px; }
+.fs-tools { display:flex; gap:6px; flex-wrap:wrap; }
+.fs-scroll { overflow-x:auto; }
+.fs-table { width:100%; min-width:640px; }
+.fs-table td.fs-name a { font-weight:600; }
+.fs-table td.fs-actions { white-space:nowrap; }
+.fs-table td.fs-actions .btn { margin:0 4px 4px 0; padding:4px 9px; font-size:12px; }
+.fs-edit { display:grid; grid-template-columns:1fr 1fr; gap:6px 10px; margin-top:8px; padding:10px; border:1px solid var(--line); border-radius:8px; min-width:320px; }
+.fs-edit label { display:flex; flex-direction:column; font-size:12px; gap:3px; }
+.fs-crumbs { margin: 0 0 8px; font-size:12.5px; }
+.fs-empty { padding:16px 10px; color: var(--muted); }
+.fs-detail { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); }
+.fs-upload { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:12px; }
+</style>
+
+<%+footer%>

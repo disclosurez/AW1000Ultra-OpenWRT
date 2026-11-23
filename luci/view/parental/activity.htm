@@ -1,0 +1,335 @@
+<%+header%>
+<%
+local fs = require "nixio.fs"
+local sys = require "luci.sys"
+local util = require "luci.util"
+local http = require "luci.http"
+local pcdata = util.pcdata
+
+local scope = http.formvalue("scope") or "all"
+if scope ~= "lan" and scope ~= "guest" then scope = "all" end
+
+-- Guest bridge members (the vendor stack can rename the VIFs)
+local guest_ifaces = { ["br-guest"] = true, ra1 = true, rai1 = true }
+for v in (sys.exec("uci -q get wifi_guest.main.ifaces") or ""):gmatch("%S+") do
+	guest_ifaces[v:lower()] = true
+end
+
+local function net_scope(ip, dev)
+	if ip and ip:match("^192%.168%.5%.") then return "guest" end
+	if dev then
+		dev = dev:lower()
+		if guest_ifaces[dev] then return "guest" end
+		if dev == "br-lan" or dev == "ra0" or dev == "rai0" or
+		   dev == "eth0" or dev == "rndis0" then
+			return "lan"
+		end
+	end
+	return "lan"
+end
+
+-- live rule state
+local rstate, rlist = {}, {}
+local st = fs.readfile("/tmp/parental.status") or ""
+for line in st:gmatch("[^\n]+") do
+	local mac, name, state, mode, win = line:match("^([^|]+)|([^|]+)|([^|]+)|([^|]*)|(.*)$")
+	if mac then
+		local e = { mac = mac, name = name, state = state, mode = mode, window = win }
+		rstate[mac:lower()] = e
+		rlist[#rlist + 1] = e
+	end
+end
+
+-- connected devices (DHCP leases first, then ARP)
+local devices, seen = {}, {}
+local lease = fs.readfile("/tmp/dhcp.leases") or ""
+for line in lease:gmatch("[^\n]+") do
+	local _, mac, ip, host = line:match("^(%S+) (%S+) (%S+) (%S+)")
+	if mac and ip then
+		devices[#devices + 1] = { ip = ip, mac = mac, host = (host ~= "*") and host or "",
+			src = "DHCP", scope = net_scope(ip) }
+		seen[mac:lower()] = true
+	end
+end
+local function add_neigh(cmd, src, net)
+	local out = sys.exec(cmd) or ""
+	for line in out:gmatch("[^\n]+") do
+		local ip, mac = line:match("^(%d+%.%d+%.%d+%.%d+)%s+.-lladdr%s+(%S+)")
+		if ip and mac and not seen[mac:lower()] then
+			devices[#devices + 1] = { ip = ip, mac = mac, host = "", src = src,
+				scope = net or net_scope(ip) }
+			seen[mac:lower()] = true
+		end
+	end
+end
+add_neigh("ip -4 neigh show dev br-lan 2>/dev/null", "ARP", "lan")
+add_neigh("ip -4 neigh show dev br-guest 2>/dev/null", "Guest", "guest")
+-- bridge FDB: catches wired/static devices that have no ARP/lease entry
+local fdb = sys.exec("bridge fdb show br br-lan 2>/dev/null; bridge fdb show br br-guest 2>/dev/null") or ""
+for line in fdb:gmatch("[^\n]+") do
+	local mac, dev = line:match("^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x) dev (%S+)")
+	if mac then
+		local m = mac:lower()
+		local skip = line:match(" self ") or line:match(" permanent") or
+			m:sub(1, 2) == "01" or m == "ff:ff:ff:ff:ff:ff" or
+			m:match("^34:19:4d")
+		if not skip and not seen[m] then
+			devices[#devices + 1] = { ip = "", mac = mac, host = "",
+				src = (dev == "rai0" or dev == "ra0") and "WiFi" or "L2",
+				scope = net_scope(nil, dev) }
+			seen[m] = true
+		end
+	end
+end
+
+local function ipnum(ip)
+	local a, b, c, d = ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+	return a and (tonumber(a) * 16777216 + tonumber(b) * 65536 + tonumber(c) * 256 + tonumber(d)) or 0
+end
+table.sort(devices, function(x, y)
+	if x.ip == "" and y.ip == "" then return x.mac < y.mac end
+	if x.ip == "" then return false end
+	if y.ip == "" then return true end
+	return ipnum(x.ip) < ipnum(y.ip)
+end)
+
+-- traffic totals per MAC (persisted by /usr/sbin/parental-acct)
+local usage = {}
+local db = fs.readfile("/etc/parental_usage") or ""
+for line in db:gmatch("[^\n]+") do
+	local mac, up, down, ts = line:match("^([^|]+)|(%d+)|(%d+)|(%d+)$")
+	if mac then
+		usage[mac:lower()] = { up = tonumber(up), down = tonumber(down), ts = tonumber(ts) }
+	end
+end
+
+-- cached TCP port scan results
+local portmap = {}
+local pcache = fs.readfile("/tmp/portscan.cache") or ""
+for line in pcache:gmatch("[^\n]+") do
+	local ip, ports = line:match("^([^|]+)|([^|]*)|")
+	if ip then portmap[ip] = ports end
+end
+
+local function fmtbytes(b)
+	b = tonumber(b) or 0
+	if b >= 1073741824 then
+		return string.format("%.2f GB", b / 1073741824)
+	elseif b >= 1048576 then
+		return string.format("%.1f MB", b / 1048576)
+	elseif b >= 1024 then
+		return string.format("%.1f kB", b / 1024)
+	end
+	return tostring(b) .. " B"
+end
+
+local blocked_now = 0
+for _, r in ipairs(rlist) do
+	if r.state == "blocked" then blocked_now = blocked_now + 1 end
+end
+local managed = 0
+local visible = {}
+for _, d in ipairs(devices) do
+	if scope == "all" or d.scope == scope then visible[#visible + 1] = d end
+	if rstate[d.mac:lower()] then managed = managed + 1 end
+end
+
+-- MAC vendor database (Wireshark manuf, refreshed by /usr/sbin/oui-update)
+local oui = {}
+local of = io.open("/data/oui/oui.tsv", "r")
+if of then
+	for line in of:lines() do
+		local p, v = line:match("^(%x+)\t(.+)$")
+		if p then oui[p] = v end
+	end
+	of:close()
+end
+local function vendor(mac)
+	local s = mac:lower():gsub(":", "")
+	return oui[s:sub(1,10)] or oui[s:sub(1,9)] or oui[s:sub(1,7)] or oui[s:sub(1,6)] or "—"
+end
+
+-- MACs that can never be blocked (management devices)
+local exempt = {}
+uci:foreach("parental", "settings", function(s)
+	local ex = s.exempt
+	if type(ex) == "table" then
+		for _, m in ipairs(ex) do exempt[m:lower()] = true end
+	elseif type(ex) == "string" then
+		for m in ex:gmatch("%S+") do exempt[m:lower()] = true end
+	end
+end)
+%>
+<h2 name="content"><%:Parental Control — Devices & Activity%></h2>
+<p class="cbi-map-descr"><%:Devices currently seen on the LAN, the live state of each rule, and recent blocking activity. Use the Blocking Rules tab to add or change rules.%></p>
+
+<div class="cbi-section" style="padding:10px 16px;margin:14px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+	<span class="cbi-section-descr"><%:Scope%>:</span>
+	<a class="btn <%= (scope == "all") and "btn-primary" or "" %>" href="<%=url('admin/network/parental/activity')%>?scope=all"><%:All%></a>
+	<a class="btn <%= (scope == "lan") and "btn-primary" or "" %>" href="<%=url('admin/network/parental/activity')%>?scope=lan"><%:LAN%></a>
+	<a class="btn <%= (scope == "guest") and "btn-primary" or "" %>" href="<%=url('admin/network/parental/activity')%>?scope=guest"><%:Guest Wi-Fi%></a>
+	<span class="cbi-section-descr"><%:Guest Wi-Fi is 192.168.5.0/24; LAN is the main 192.168.0.0/24.%></span>
+</div>
+
+<div class="pc-summary">
+	<div class="pc-stat"><b><%=#visible%></b><span><%:Devices seen%></span></div>
+	<div class="pc-stat"><b><%=#rlist%></b><span><%:Rules configured%></span></div>
+	<div class="pc-stat<%= (blocked_now > 0) and " is-danger" or "" %>"><b><%=blocked_now%></b><span><%:Blocked right now%></span></div>
+</div>
+
+<div class="pc-toolbar">
+	<h3><%:Connected devices%></h3>
+	<div class="pc-tools">
+		<input type="search" id="pc-filter" class="pc-filter" placeholder="<%:Filter IP, MAC or hostname%>" aria-label="<%:Filter devices%>" autocomplete="off">
+		<form method="post" action="<%=url('admin/network/parental/scan')%>" style="display:inline;margin:0">
+			<input type="hidden" name="token" value="<%=token%>" />
+			<input type="hidden" name="scope" value="<%=scope%>" />
+			<button type="submit" class="btn"><%:Scan LAN%></button>
+		</form>
+		<button type="button" class="btn" onclick="location.reload()"><%:Refresh%></button>
+	</div>
+</div>
+<div class="pc-scroll pc-devices">
+<table class="cbi-section-table pc-table">
+	<thead>
+	<tr>
+		<th><%:IP address%></th>
+		<th><%:MAC address%></th>
+		<th><%:Hostname%></th>
+		<th><%:Manufacturer%></th>
+		<th><%:Seen via%></th>
+		<th><%:Control%></th>
+		<th class="right"><%:Uploaded%></th>
+		<th class="right"><%:Downloaded%></th>
+		<th><%:Open ports%></th>
+		<th><%:Action%></th>
+	</tr>
+	</thead>
+	<tbody id="pc-device-body">
+	<% if #visible == 0 then %>
+	<tr><td colspan="10"><em><% if #devices == 0 then %><%:No devices found on the LAN.%><% elseif scope == "guest" then %><%:No guest devices are connected right now.%><% else %><%:No devices in this view.%><% end %></em></td></tr>
+	<% end %>
+	<% for _, d in ipairs(visible) do local rs = rstate[d.mac:lower()]; local u = usage[d.mac:lower()]; local v = vendor(d.mac) %>
+	<tr data-search="<%=pcdata((d.ip .. " " .. d.mac .. " " .. d.host .. " " .. v):lower())%>">
+		<td class="mono"><%= d.ip ~= "" and pcdata(d.ip) or "—" %></td>
+		<td class="mono"><%=pcdata(d.mac)%></td>
+		<td><%=pcdata(d.host)%></td>
+		<td><%=pcdata(v)%></td>
+		<td><%=pcdata(d.src)%></td>
+		<td>
+			<% if not rs then %>
+				<span class="pc-state is-managed"><%:not managed%></span>
+			<% elseif rs.state == "blocked" then %>
+				<span class="pc-state is-blocked"><%:blocked%></span>
+			<% else %>
+				<span class="pc-state is-allowed"><%:allowed%></span>
+			<% end %>
+		</td>
+		<td class="mono right"><%= u and fmtbytes(u.up) or "—" %></td>
+		<td class="mono right"><%= u and fmtbytes(u.down) or "—" %></td>
+		<td class="mono"><%= pcdata(portmap[d.ip] or "—") %></td>
+		<td class="pc-action">
+		<% if d.ip ~= "" then %>
+			<form method="post" action="<%=url('admin/network/parental/portscan')%>" style="display:inline;margin:0 4px 0 0">
+				<input type="hidden" name="token" value="<%=token%>" />
+				<input type="hidden" name="ip" value="<%=pcdata(d.ip)%>" />
+				<input type="hidden" name="scope" value="<%=scope%>" />
+				<button type="submit" class="btn"><%:Ports%></button>
+			</form>
+		<% end %>
+		<% if exempt[d.mac:lower()] then %>
+			<span class="pc-state is-managed"><%:exempt%></span>
+		<% else
+			local op = rs and "unblock" or "block"
+		%>
+			<form method="post" action="<%=url('admin/network/parental/toggle')%>" style="margin:0">
+				<input type="hidden" name="token" value="<%=token%>" />
+				<input type="hidden" name="scope" value="<%=scope%>" />
+				<input type="hidden" name="mac" value="<%=pcdata(d.mac)%>" />
+				<input type="hidden" name="name" value="<%=pcdata(d.host ~= "" and d.host or d.mac)%>" />
+				<input type="hidden" name="op" value="<%=op%>" />
+				<button type="submit" class="btn"><%= (op == "block") and translate("Block") or translate("Unblock") %></button>
+			</form>
+		<% end %>
+		</td>
+	</tr>
+	<% end %>
+	<tr id="pc-none" hidden><td colspan="10"><em><%:No devices match this filter.%></em></td></tr>
+	</tbody>
+</table>
+</div>
+<p class="cbi-section-descr"><%:Traffic totals are sampled from the firewall counters and are approximate — hardware acceleration can move traffic without passing through them. Open ports are TCP connect scans of common services; they refresh automatically every 30 minutes, or on demand with the Ports button.%></p>
+
+<h3><%:Active rules%></h3>
+<div class="pc-scroll">
+<table class="cbi-section-table pc-table" style="min-width:720px">
+	<thead>
+	<tr>
+		<th><%:Device%></th>
+		<th><%:MAC address%></th>
+		<th><%:Mode%></th>
+		<th><%:Window%></th>
+		<th><%:State%></th>
+	</tr>
+	</thead>
+	<tbody>
+	<% if #rlist == 0 then %>
+	<tr><td colspan="5"><em><%:No rules configured.%></em></td></tr>
+	<% end %>
+	<% for _, r in ipairs(rlist) do %>
+	<tr>
+		<td><%=pcdata(r.name)%></td>
+		<td class="mono"><%=pcdata(r.mac)%></td>
+		<td><%=pcdata(r.mode)%></td>
+		<td class="mono"><%=pcdata((r.window or ""):gsub("^%s+", ""))%></td>
+		<td>
+			<% if r.state == "blocked" then %>
+				<span class="pc-state is-blocked"><%:blocked%></span>
+			<% else %>
+				<span class="pc-state is-allowed"><%:allowed%></span>
+			<% end %>
+		</td>
+	</tr>
+	<% end %>
+	</tbody>
+</table>
+</div>
+
+<h3><%:Recent activity%></h3>
+<p class="cbi-section-descr"><%:State changes are logged by the enforcement script; blocked connection attempts come from the firewall log, rate limited.%></p>
+<%
+local log = fs.readfile("/tmp/parental.log") or ""
+local lines = {}
+for l in log:gmatch("[^\n]+") do lines[#lines + 1] = l end
+local first = math.max(1, #lines - 39)
+local shown = {}
+for i = first, #lines do shown[#shown + 1] = lines[i] end
+local bw = sys.exec("logread -e 'PTRL ' 2>/dev/null | tail -n 30") or ""
+%>
+<% if #shown == 0 and (bw:gsub("%s+", "") == "") then %>
+<p class="pc-log-empty"><%:No blocking activity in the last 24 hours.%></p>
+<% else %>
+<pre class="pc-log"><% for _, l in ipairs(shown) do %><%=pcdata(l)%>
+<% end %><%=pcdata(bw)%></pre>
+<% end %>
+
+<script type="text/javascript">//<![CDATA[
+(function(){
+	var input = document.getElementById('pc-filter');
+	var body = document.getElementById('pc-device-body');
+	var none = document.getElementById('pc-none');
+	if (!input || !body || !none) return;
+	input.addEventListener('input', function(){
+		var q = input.value.trim().toLowerCase();
+		var rows = body.querySelectorAll('tr[data-search]');
+		var shown = 0;
+		for (var i = 0; i < rows.length; i++) {
+			var match = (!q || rows[i].getAttribute('data-search').indexOf(q) !== -1);
+			rows[i].hidden = !match;
+			if (match) shown++;
+		}
+		none.hidden = (shown > 0);
+	});
+})();
+//]]></script>
+<%+footer%>

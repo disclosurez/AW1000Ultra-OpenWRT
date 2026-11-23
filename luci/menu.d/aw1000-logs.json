@@ -1,0 +1,124 @@
+{
+	"admin/logs": {
+		"title": "Logs",
+		"order": 60,
+		"action": {
+			"type": "firstchild",
+			"preferred": "dnslog",
+			"recurse": true
+		}
+	},
+	"admin/logs/dnslog": {
+		"title": "DNS Log",
+		"order": 10,
+		"action": {
+			"type": "template",
+			"path": "dnslog"
+		}
+	},
+	"admin/logs/services": {
+		"title": "Services",
+		"order": 15,
+		"action": {
+			"type": "firstchild",
+			"preferred": "cloudflare",
+			"recurse": true
+		}
+	},
+	"admin/logs/services/cloudflare": {
+		"title": "Cloudflare",
+		"order": 10,
+		"action": {
+			"type": "template",
+			"path": "srvlog"
+		}
+	},
+	"admin/logs/services/parental": {
+		"title": "Parental Control",
+		"order": 20,
+		"action": {
+			"type": "template",
+			"path": "srvlog"
+		}
+	},
+	"admin/logs/services/vpn": {
+		"title": "WireGuard / VPN",
+		"order": 30,
+		"action": {
+			"type": "template",
+			"path": "srvlog"
+		}
+	},
+	"admin/logs/services/firewall": {
+		"title": "Firewall",
+		"order": 40,
+		"action": {
+			"type": "template",
+			"path": "srvlog"
+		}
+	},
+	"admin/logs/services/dhcpdns": {
+		"title": "DHCP / DNS",
+		"order": 50,
+		"action": {
+			"type": "template",
+			"path": "srvlog"
+		}
+	},
+	"admin/logs/services/sshweb": {
+		"title": "SSH / Web / Cron",
+		"order": 60,
+		"action": {
+			"type": "template",
+			"path": "srvlog"
+		}
+	},
+	"admin/logs/services/siem": {
+		"title": "SIEM Forwarding",
+		"order": 65,
+		"action": {
+			"type": "template",
+			"path": "srvlog"
+		}
+	},
+	"admin/logs/syslog": {
+		"title": "System Log",
+		"order": 20,
+		"action": {
+			"type": "template",
+			"path": "syslog"
+		}
+	},
+	"admin/logs/dmesg": {
+		"title": "Kernel Log",
+		"order": 30,
+		"action": {
+			"type": "template",
+			"path": "dmesg"
+		}
+	},
+	"admin/logs/network": {
+		"title": "Network Log",
+		"order": 40,
+		"action": {
+			"type": "template",
+			"path": "networklog"
+		}
+	},
+	"admin/logs/processes": {
+		"title": "Processes",
+		"order": 50,
+		"action": {
+			"type": "template",
+			"path": "processes"
+		}
+	},
+	"admin/logs/services/captiveportal": {
+		"title": "Captive Portal",
+		"order": 15,
+		"action": {
+			"type": "template",
+			"path": "srvlog"
+		}
+	}
+}

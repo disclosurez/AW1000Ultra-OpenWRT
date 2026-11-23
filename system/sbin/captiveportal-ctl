@@ -1,0 +1,272 @@
+#!/bin/sh
+# Captive portal enforcement.
+#
+#   captiveportal apply          rebuild the portal chains from UCI
+#   captiveportal clear          remove chains, jumps and the ipsets
+#   captiveportal sync           refresh accepted client addresses from ARP
+#   captiveportal allow <ip|mac> whitelist a client for one session
+#   captiveportal status         print counters
+#
+# Enforcement is scoped to the network interface selected in
+# /etc/config/captiveportal (option gate_iface). Only traffic entering the
+# router on that interface is gated.
+#
+# On this firmware the radios (ra0/rai0) are bridged into br-lan. Once a frame
+# is bridged, iptables sees "-i br-lan", never "-i ra0", so br-lan is the
+# interface to select. Picking a bridge member would add rules that never
+# match. The LuCI page only offers interfaces that can actually be matched.
+
+CONF=captiveportal
+FWD=PORTAL_FWD
+FWD6=PORTAL_FWD6
+NAT=PORTAL_NAT
+OK_MAC=portal_ok        # accepted clients (hash:mac, timeout)
+OK_IP=portal_ok_ip      # accepted client addresses (hash:ip, timeout)
+
+cfg() { uci -q get "$CONF.main.$1" 2>/dev/null; }
+
+lower() { printf '%s' "$1" | tr 'A-F' 'a-f'; }
+
+gate_ifaces() {
+	local i
+	i=$(cfg gate_iface)
+	[ -n "$i" ] || i=br-lan
+	printf '%s' "$i"
+}
+
+# Space-separated, lower-case MACs from the exempt list.
+exempt_macs() {
+	local m
+	for m in $(cfg exempt | tr ',' ' '); do
+		m=$(lower "$m" | tr -- '-' ':')
+		case "$m" in
+			[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+			*) continue ;;
+		esac
+		printf '%s ' "$m"
+	done
+}
+
+valid_iface() {
+	case "$1" in
+		""|*[!A-Za-z0-9_.:-]*) return 1 ;;
+	esac
+	return 0
+}
+
+arp_mac() {
+	awk -v ip="$1" '$1 == ip { print tolower($4); exit }' /proc/net/arp 2>/dev/null
+}
+
+# IPv4 address of the gated interface (the splash is served on every address,
+# but the DNAT target must be reachable from that interface's subnet).
+iface_ip() {
+	local iface="$1" ip
+	ip=$(ip addr show dev "$iface" 2>/dev/null \
+		| awk '/inet / { sub(/\/.*/, "", $2); print $2; exit }')
+	[ -n "$ip" ] || ip=$(uci -q get network.lan.ipaddr)
+	[ -n "$ip" ] || ip=192.168.0.1
+	printf '%s' "$ip"
+}
+
+# Create a set, replacing it if an older version used a different type.
+ensure_set() {
+	local name="$1" type="$2" cur
+	shift 2
+	cur=$(ipset list -t "$name" 2>/dev/null | awk '/^Type:/ { print $2 }')
+	[ -n "$cur" ] && [ "$cur" != "$type" ] && ipset destroy "$name" 2>/dev/null
+	ipset create "$name" "$type" "$@" -exist
+}
+
+clear_chains() {
+	while iptables -D FORWARD -j "$FWD" 2>/dev/null; do :; done
+	while ip6tables -D FORWARD -j "$FWD6" 2>/dev/null; do :; done
+	while iptables -t nat -D PREROUTING -j "$NAT" 2>/dev/null; do :; done
+
+	iptables -F "$FWD" 2>/dev/null
+	iptables -X "$FWD" 2>/dev/null
+	ip6tables -F "$FWD6" 2>/dev/null
+	ip6tables -X "$FWD6" 2>/dev/null
+	iptables -t nat -F "$NAT" 2>/dev/null
+	iptables -t nat -X "$NAT" 2>/dev/null
+	return 0
+}
+
+clear_all() {
+	clear_chains
+	ipset destroy "$OK_MAC" 2>/dev/null
+	ipset destroy "$OK_IP" 2>/dev/null
+	ipset destroy portal_wifi 2>/dev/null
+	ipset destroy portal_wifi_ip 2>/dev/null
+	return 0
+}
+
+sets_up() {
+	ensure_set "$OK_MAC" hash:mac timeout 10080
+	ensure_set "$OK_IP" hash:ip timeout 10080
+}
+
+# Remaining session time of an accepted MAC, in seconds.
+mac_timeout() {
+	ipset list "$OK_MAC" 2>/dev/null | awk -v m="$1" '$1 == m && $2 == "timeout" { print $3; exit }'
+}
+
+# The nat redirect cannot match a hash:mac set on this kernel, so accepted
+# clients also keep their current address in portal_ok_ip. Refresh it from the
+# ARP table: a DHCP renewal does not break the splash bypass.
+sync_ips() {
+	local ip _hw _flags mac _mask _dev t
+
+	sets_up
+	[ -r /proc/net/arp ] || return 0
+
+	while read -r ip _hw _flags mac _mask _dev; do
+		case "$ip" in ""|*[!0-9.]*) continue ;; esac
+		mac=$(lower "$mac")
+		case "$mac" in
+			[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+			*) continue ;;
+		esac
+		ipset test "$OK_MAC" "$mac" >/dev/null 2>&1 || continue
+		t=$(mac_timeout "$mac")
+		case "$t" in ""|*[!0-9]*|0) continue ;; esac
+		ipset add "$OK_IP" "$ip" timeout "$t" -exist 2>/dev/null
+	done < /proc/net/arp
+
+	# Drop addresses whose ARP entry now belongs to a different, unaccepted
+	# device: a reused DHCP address must not inherit a splash bypass.
+	ipset list "$OK_IP" 2>/dev/null | awk '/^[0-9]+\./ { print $1 }' | while read -r ip; do
+		mac=$(arp_mac "$ip")
+		[ -n "$mac" ] || continue
+		ipset test "$OK_MAC" "$mac" >/dev/null 2>&1 && continue
+		ipset del "$OK_IP" "$ip" 2>/dev/null
+	done
+}
+
+apply_local() {
+	local port iface mac exempt local_ip
+
+	port=$(cfg port); [ -n "$port" ] || port=8088
+
+	sets_up
+	sync_ips
+	exempt=$(exempt_macs)
+
+	iptables -N "$FWD" 2>/dev/null
+	ip6tables -N "$FWD6" 2>/dev/null
+	iptables -t nat -N "$NAT" 2>/dev/null
+
+	for iface in $(gate_ifaces); do
+		if ! valid_iface "$iface"; then
+			logger -t captive-portal "ignoring invalid interface '$iface'"
+			continue
+		fi
+
+		# A bridge port never appears as the input interface; warn instead of
+		# silently installing rules that can never match.
+		if [ ! -d "/sys/class/net/$iface/brif" ] && \
+		   [ -n "$(ls -d /sys/class/net/*/brif/"$iface" 2>/dev/null)" ]; then
+			logger -t captive-portal "warning: $iface is a bridge member; select the bridge instead"
+		fi
+
+		local_ip=$(iface_ip "$iface")
+
+		# Exempt devices never see the portal, whichever interface they use.
+		# Per-MAC rules work in nat too, where hash:mac sets are not usable.
+		for mac in $exempt; do
+			iptables  -A "$FWD"  -i "$iface" -m mac --mac-source "$mac" -j RETURN
+			ip6tables -A "$FWD6" -i "$iface" -m mac --mac-source "$mac" -j RETURN
+			iptables  -t nat -A "$NAT" -i "$iface" -m mac --mac-source "$mac" -j RETURN
+		done
+
+		# Accepted clients pass (MAC first, address only as a fallback).
+		iptables -A "$FWD" -i "$iface" -m set --match-set "$OK_MAC" src -j RETURN
+		iptables -A "$FWD" -i "$iface" -m set --match-set "$OK_IP" src -j RETURN
+
+		# DNS and DHCP must keep working while the client reads the terms.
+		iptables -A "$FWD" -i "$iface" -p udp --dport 53 -j RETURN
+		iptables -A "$FWD" -i "$iface" -p tcp --dport 53 -j RETURN
+		iptables -A "$FWD" -i "$iface" -p udp --dport 67:68 -j RETURN
+
+		# Everything else waits for an acceptance.
+		iptables -A "$FWD" -i "$iface" -j REJECT
+
+		# Plain HTTP goes to the splash page, except traffic to the router's
+		# own LuCI: management must not depend on the portal. HTTPS is
+		# refused so the device shows its own "sign-in to Wi-Fi" prompt.
+		iptables -t nat -A "$NAT" -i "$iface" -m set --match-set "$OK_IP" src -j RETURN
+		iptables -t nat -A "$NAT" -i "$iface" -d "$local_ip" -p tcp --dport 80 -j RETURN
+		iptables -t nat -A "$NAT" -i "$iface" -p tcp --dport 80 \
+			-j DNAT --to-destination "$local_ip:$port"
+
+		# IPv6 has no redirect here; just keep it closed until acceptance.
+		ip6tables -A "$FWD6" -i "$iface" -m set --match-set "$OK_MAC" src -j RETURN
+		ip6tables -A "$FWD6" -i "$iface" -p udp --dport 53 -j RETURN
+		ip6tables -A "$FWD6" -i "$iface" -p tcp --dport 53 -j RETURN
+		ip6tables -A "$FWD6" -i "$iface" -j REJECT
+	done
+
+	iptables  -I FORWARD 1 -j "$FWD"
+	ip6tables -I FORWARD 1 -j "$FWD6"
+	iptables  -t nat -I PREROUTING 1 -j "$NAT"
+
+	logger -t captive-portal "local mode: gating $(gate_ifaces) on port $port"
+}
+
+apply_rules() {
+	clear_chains
+
+	# Sets left behind by the old DHCP/MAC implementation.
+	ipset destroy portal_wifi 2>/dev/null
+	ipset destroy portal_wifi_ip 2>/dev/null
+
+	[ "$(cfg enabled)" = "0" ] && return 0
+
+	apply_local
+}
+
+allow_client() {
+	local arg="$1" ip mac minutes
+	minutes=$(cfg session_minutes); [ -n "$minutes" ] || minutes=240
+	[ -n "$arg" ] || return 1
+
+	sets_up
+	case "$arg" in
+		[0-9a-fA-F][0-9a-fA-F]:*|[0-9a-fA-F][0-9a-fA-F]-*)
+			mac=$(lower "$arg" | tr -- '-' ':')
+			ipset add "$OK_MAC" "$mac" timeout $((minutes * 60)) -exist 2>/dev/null
+			;;
+		*)
+			ip="$arg"
+			mac=$(arp_mac "$ip")
+			if [ -n "$mac" ]; then
+				ipset add "$OK_MAC" "$mac" timeout $((minutes * 60)) -exist 2>/dev/null
+			fi
+			ipset add "$OK_IP" "$ip" timeout $((minutes * 60)) -exist 2>/dev/null
+			conntrack -D -s "$ip" >/dev/null 2>&1
+			;;
+	esac
+	sync_ips
+	logger -t captive-portal "session opened for ${mac:-$arg} (${minutes}m)"
+}
+
+status() {
+	local s n
+	echo "mode=local"
+	echo "enabled=$(cfg enabled)"
+	echo "gate_iface=$(gate_ifaces)"
+	echo "port=$(cfg port)"
+	for s in "$OK_MAC" "$OK_IP"; do
+		n=$(ipset list "$s" 2>/dev/null | awk '/^Number of entries/ { print $4 }')
+		echo "$s=${n:-0}"
+	done
+}
+
+case "$1" in
+	apply)  apply_rules ;;
+	clear)  clear_all ;;
+	sync)   sync_ips ;;
+	allow)  allow_client "$2" ;;
+	status) status ;;
+	*)      echo "usage: $0 apply|clear|sync|allow <ip|mac>|status" >&2; exit 1 ;;
+esac

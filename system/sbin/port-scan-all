@@ -1,0 +1,34 @@
+#!/bin/sh
+# Periodic TCP port scan of all known LAN/guest devices.
+# Results replace /tmp/portscan.cache, so the Parental Control page stays fresh.
+CACHE=/tmp/portscan.cache
+TMP=/tmp/portscan.all.$$
+IPL=/tmp/portscan.ips.$$
+LOCK=/tmp/portscan.lock
+
+mkdir "$LOCK" 2>/dev/null || exit 0
+trap 'rmdir "$LOCK" 2>/dev/null; rm -f "$TMP" "$IPL"' EXIT
+
+: > "$TMP"
+
+{
+	awk '{print $3}' /tmp/dhcp.leases 2>/dev/null
+	ip -4 neigh show dev br-lan 2>/dev/null | awk '/lladdr/{print $1}'
+	ip -4 neigh show dev br-guest 2>/dev/null | awk '/lladdr/{print $1}'
+} | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' |
+	grep -vE '^(192\.168\.0\.1|192\.168\.5\.1)$' |
+	sort -u > "$IPL"
+
+i=0
+while read -r ip; do
+	(
+		ports=$(/usr/sbin/port-scan "$ip")
+		echo "$ip|$ports|$(date +%s)" >> "$TMP"
+	) &
+	i=$((i + 1))
+	if [ $((i % 8)) -eq 0 ]; then wait; fi
+done < "$IPL"
+wait
+
+sort -t'|' -k1,1 "$TMP" > "$CACHE"
+exit 0

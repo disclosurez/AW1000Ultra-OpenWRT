@@ -1,0 +1,3 @@
+#!/bin/sh
+# Runs after every firewall reload so the PARENTAL chain and its jump survive.
+/usr/sbin/parental-control apply >/dev/null 2>&1

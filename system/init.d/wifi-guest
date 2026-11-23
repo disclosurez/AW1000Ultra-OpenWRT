@@ -1,0 +1,16 @@
+#!/bin/sh /etc/rc.common
+# Re-create the isolated guest bridge and re-attach the saved guest VIFs.
+# The bridge is intentionally outside netifd: the vendor wapp owns the Wi-Fi
+# VIFs and netifd's bridge setup fights it.
+
+START=99
+STOP=10
+
+start() {
+	/usr/sbin/wifi-guest prepare
+	/usr/sbin/wifi-guest boot
+}
+
+stop() {
+	:
+}

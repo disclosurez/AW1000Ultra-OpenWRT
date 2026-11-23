@@ -1,0 +1,14 @@
+# Seed for /etc/config/leds — written only if the file does not exist.
+#
+# The vendor led_ctrld drives the LEDs from the modem state, which is wrong
+# once the wired ISP uplink is primary and the SIM is parked. This controller
+# drives them from the real uplink state instead (see /usr/sbin/aw1000-led).
+
+config leds 'settings'
+	option enabled '1'
+	# Blink the internet LED while the uplink is offline (0 = solid off)
+	option blink_offline '1'
+	# Seconds between LED state refreshes (minimum 2)
+	option interval '5'
+	# Force a state for testing: 'online' or 'offline'. Empty = real state.
+	option test_state ''

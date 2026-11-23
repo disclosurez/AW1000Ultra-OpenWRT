@@ -1,0 +1,8 @@
+#!/bin/sh
+# A guest Wi-Fi VIF came up; make sure it is in br-guest.
+[ "$ACTION" = "ifup" ] || exit 0
+case "$INTERFACE" in
+	ra[0-9]*|rai[0-9]*) ;;
+	*) exit 0 ;;
+esac
+/usr/sbin/wifi-guest claim "$INTERFACE" >/dev/null 2>&1

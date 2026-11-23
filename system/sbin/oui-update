@@ -1,0 +1,19 @@
+#!/bin/sh
+# Refresh the MAC vendor database from the Wireshark manuf file.
+URL="https://www.wireshark.org/download/automated/data/manuf"
+TMP=/tmp/manuf.$$
+mkdir -p /data/oui
+if curl -sSL --max-time 120 -o "$TMP" "$URL"; then
+	awk -F'\t' '
+		!/^#/ && NF >= 3 {
+			p = $1
+			gsub(/[ \t\r]/, "", p)
+			sub("/.*", "", p)
+			gsub(":", "", p)
+			v = $3
+			gsub(/\r/, "", v)
+			if (p ~ /^[0-9A-Fa-f]+$/)
+				print tolower(p) "\t" v
+		}' "$TMP" | sort -u > /data/oui/oui.tsv
+	rm -f "$TMP"
+fi

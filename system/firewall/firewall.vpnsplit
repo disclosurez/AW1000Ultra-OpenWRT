@@ -1,0 +1,27 @@
+#!/bin/sh
+# Split-tunnel helper (run by fw3 on every firewall reload).
+# Creates the ipset and marks packets whose destination is in it,
+# so policy routing sends only those flows through the selected VPN.
+VPN_SET=vpnset
+
+if ipset list "$VPN_SET" >/dev/null 2>&1; then
+	type=$(ipset list "$VPN_SET" | sed -n 's/^Type: //p')
+	if [ "$type" != "hash:net" ]; then
+		ipset destroy "$VPN_SET" 2>/dev/null
+	fi
+fi
+ipset create "$VPN_SET" hash:net -exist
+
+dns=$(uci -q get vpnsplit.settings.dns)
+[ -n "$dns" ] || dns=103.86.96.100
+ipset add "$VPN_SET" "$dns" -exist
+ipset add "$VPN_SET" 103.86.96.100 -exist
+ipset add "$VPN_SET" 103.86.99.100 -exist
+for ip in $(uci -q get vpnsplit.settings.ips); do
+	ipset add "$VPN_SET" "$ip" -exist
+done
+
+for chain in PREROUTING OUTPUT; do
+	iptables -t mangle -D "$chain" -m set --match-set "$VPN_SET" dst -j MARK --set-mark 0x1 2>/dev/null
+	iptables -t mangle -A "$chain" -m set --match-set "$VPN_SET" dst -j MARK --set-mark 0x1
+done

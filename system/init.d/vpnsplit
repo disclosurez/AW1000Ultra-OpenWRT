@@ -1,0 +1,135 @@
+#!/bin/sh /etc/rc.common
+# VPN split tunnel: keeps dnsmasq lists in sync with /etc/config/vpnsplit,
+# maintains the ipset (domains + static IPs) and policy routing.
+START=19
+STOP=89
+USE_PROCD=1
+
+VPN_SET=vpnset
+VPN_DNS_DEFAULT=103.86.96.100
+STATIC_CACHE=/tmp/vpnset.static
+
+get_dns() {
+	local dns
+	dns=$(uci -q get vpnsplit.settings.dns)
+	[ -n "$dns" ] || dns=$VPN_DNS_DEFAULT
+	echo "$dns"
+}
+
+get_vpn() {
+	local vpn
+	vpn=$(uci -q get vpnsplit.settings.vpn)
+	[ -n "$vpn" ] || vpn=wgvpn
+	echo "$vpn"
+}
+
+remove_mark_rules() {
+	for chain in PREROUTING OUTPUT; do
+		iptables -t mangle -D "$chain" -m set --match-set "$VPN_SET" dst \
+			-j MARK --set-mark 0x1 2>/dev/null
+	done
+}
+
+add_mark_rules() {
+	for chain in PREROUTING OUTPUT; do
+		iptables -t mangle -C "$chain" -m set --match-set "$VPN_SET" dst \
+			-j MARK --set-mark 0x1 2>/dev/null ||
+		iptables -t mangle -A "$chain" -m set --match-set "$VPN_SET" dst \
+			-j MARK --set-mark 0x1
+	done
+}
+
+ensure_set() {
+	local type
+
+	if ipset list "$VPN_SET" >/dev/null 2>&1; then
+		type=$(ipset list "$VPN_SET" | sed -n 's/^Type: //p')
+		if [ "$type" != "hash:net" ]; then
+			remove_mark_rules
+			ipset destroy "$VPN_SET" 2>/dev/null
+		fi
+	fi
+	ipset create "$VPN_SET" hash:net -exist
+}
+
+sync_static_ips() {
+	local ip old
+
+	[ -f "$STATIC_CACHE" ] || : > "$STATIC_CACHE"
+	: > "$STATIC_CACHE.new"
+
+	for old in $(cat "$STATIC_CACHE"); do
+		case " $(uci -q get vpnsplit.settings.ips) " in
+			*" $old "*) echo "$old" >> "$STATIC_CACHE.new" ;;
+			*) ipset del "$VPN_SET" "$old" 2>/dev/null ;;
+		esac
+	done
+
+	for ip in $(uci -q get vpnsplit.settings.ips); do
+		ipset add "$VPN_SET" "$ip" -exist
+		echo "$ip" >> "$STATIC_CACHE.new"
+	done
+
+	mv "$STATIC_CACHE.new" "$STATIC_CACHE"
+}
+
+setup_routing() {
+	local vpn
+	vpn=$(get_vpn)
+
+	ensure_set
+	ipset add "$VPN_SET" "$(get_dns)" -exist
+	ipset add "$VPN_SET" 103.86.96.100 -exist
+	ipset add "$VPN_SET" 103.86.99.100 -exist
+	sync_static_ips
+	add_mark_rules
+
+	ip rule add fwmark 0x1 table 100 priority 100 2>/dev/null
+
+	if ip -4 addr show "$vpn" 2>/dev/null | grep -q 'inet '; then
+		ip route replace default dev "$vpn" table 100
+	else
+		ip route replace blackhole default table 100
+	fi
+}
+
+sync_config() {
+	local dns domains d entry
+
+	dns=$(get_dns)
+	domains=$(uci -q get vpnsplit.settings.domains)
+
+	uci -q delete dhcp.@dnsmasq[0].ipset
+	uci -q delete dhcp.@dnsmasq[0].server
+
+	if [ -n "$domains" ]; then
+		entry=""
+		for d in $domains; do
+			entry="$entry/$d"
+		done
+		uci add_list dhcp.@dnsmasq[0].ipset="${entry}/$VPN_SET"
+		for d in $domains; do
+			uci add_list dhcp.@dnsmasq[0].server="/$d/$dns"
+		done
+	fi
+	uci commit dhcp
+}
+
+start_service() {
+	setup_routing
+	sync_config
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+}
+
+reload_service() {
+	start_service
+}
+
+service_triggers() {
+	procd_add_reload_trigger "vpnsplit"
+}
+
+stop_service() {
+	ip rule del fwmark 0x1 table 100 priority 100 2>/dev/null
+	ip route flush table 100 2>/dev/null
+}

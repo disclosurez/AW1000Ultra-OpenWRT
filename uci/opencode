@@ -1,0 +1,15 @@
+config settings 'settings'
+	option enabled '1'
+	# Local port for the proxied OpenCode web UI (LAN only).
+	option port '8091'
+	# OpenCode server base URL, e.g. https://xxxx.opentunnel.xyz or
+	# http://192.0.2.20:4096
+	option upstream ''
+	# Server password (the one `opencode serve` prints). Used to mint a
+	# pairing code. Leave empty when using a one-time pairing link.
+	option password ''
+	# One-time link from `opencode pair` / `opencode pair --remote`
+	# (…/auth/connect/<code>). When set it wins over the password.
+	option pair_url ''
+	# Skip TLS verification (self-signed tunnel endpoints only).
+	option insecure '0'

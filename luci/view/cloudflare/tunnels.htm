@@ -1,0 +1,210 @@
+<%+header%>
+<%
+local uci  = require "luci.model.uci".cursor()
+local fs   = require "nixio.fs"
+local sys  = require "luci.sys"
+local util = require "luci.util"
+local pcdata = util.pcdata
+
+local saved = luci.http.formvalue("saved")
+
+local function tok_file(sec, s)
+	return s.token_file or ("/etc/cloudflare-tunnel-" .. sec .. ".token")
+end
+
+local function is_running(path)
+	local base = (path or ""):match("[^/]+$") or ""
+	if base == "" then return false end
+	return sys.call("pgrep -f '" .. base .. "' >/dev/null 2>&1") == 0
+end
+
+local tunnels = {}
+uci:foreach("cloudflare", "tunnel", function(s)
+	tunnels[#tunnels + 1] = {
+		section = s[".name"],
+		name = s.name or s[".name"],
+		enabled = (s.enabled == "1"),
+		token_file = tok_file(s[".name"], s),
+		has_token = fs.access(tok_file(s[".name"], s)) and (fs.stat(tok_file(s[".name"], s), "size") or 0) > 0
+	}
+end)
+
+local cf_log = sys.exec("logread -e 'cloudflared' 2>/dev/null | tail -n 8") or ""
+%>
+
+<style type="text/css">
+.cf-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+.cf-on   { background:#5cb85c; }
+.cf-off  { background:#d9534f; }
+.cf-warn { background:#f0ad4e; }
+.cf-log  { background:#1e1e1e; color:#d0d0d0; font-size:11px; line-height:1.45; padding:10px 12px;
+           border-radius:4px; max-height:170px; overflow:auto; white-space:pre-wrap; word-break:break-all; margin:0; }
+.cf-mono { font-family:monospace; }
+.cf-tok  { width:100%; min-width:220px; }
+</style>
+
+<h2 name="content"><%:Cloudflare Tunnels%></h2>
+
+<p class="cbi-map-descr">
+	<%:Runs a%> <code>cloudflared</code> <%:connector on the router so LAN services can be published through Cloudflare without opening ports on the WAN. Cloudflare terminates TLS; the router only makes outbound connections.%>
+</p>
+
+<% if saved then %>
+<div class="alert-message success" style="margin:10px 0;padding:8px 12px;background:#dff0d8;border:1px solid #d6e9c6;border-radius:4px">
+	<%:Tunnels saved and the connector was restarted.%>
+</div>
+<% end %>
+
+<div class="cbi-section">
+	<h3><%:Connectors%></h3>
+	<div class="cbi-section-node">
+	<% if #tunnels == 0 then %>
+		<p><em><%:No tunnel configured yet. Paste a connector token below.%></em></p>
+	<% else %>
+		<table class="cbi-section-table">
+			<thead>
+				<tr>
+					<th><%:Tunnel%></th>
+					<th><%:Connector token%></th>
+					<th><%:State%></th>
+				</tr>
+			</thead>
+			<tbody>
+			<% for _, t in ipairs(tunnels) do
+				local run = t.enabled and t.has_token and is_running(t.token_file)
+			%>
+				<tr>
+					<td><%=pcdata(t.name)%></td>
+					<td>
+						<% if t.has_token then %>
+							<span class="cf-dot cf-on"></span><%:stored%>
+						<% else %>
+							<span class="cf-dot cf-warn"></span><%:missing%>
+						<% end %>
+					</td>
+					<td>
+					<% if not t.enabled then %>
+						<span class="cf-dot cf-off"></span><%:disabled%>
+					<% elseif run then %>
+						<span class="cf-dot cf-on"></span><%:connected%>
+					<% else %>
+						<span class="cf-dot cf-off"></span><%:not running%>
+					<% end %>
+					</td>
+				</tr>
+			<% end %>
+			</tbody>
+		</table>
+	<% end %>
+	</div>
+</div>
+
+<div class="cbi-section">
+	<h3><%:Recent connector log%></h3>
+	<pre class="cf-log"><%
+		if cf_log:gsub("%s", "") ~= "" then
+			luci.http.write(pcdata(cf_log))
+		else
+			luci.http.write(translate("No log entries yet."))
+		end
+	%></pre>
+</div>
+
+<form method="post" action="<%=url('admin/services/cloudflare/save_tunnels')%>" class="cbi-map" id="cf-form">
+<input type="hidden" name="token" value="<%=token%>" />
+<input type="hidden" name="count" id="cf-count" value="<%=#tunnels%>" />
+
+<div class="cbi-section">
+	<h3><%:Configured tunnels%></h3>
+	<div class="cbi-section-node">
+		<table class="cbi-section-table" id="cf-table">
+			<thead>
+				<tr>
+					<th style="width:40px" title="<%:Start this connector%>"><%:On%></th>
+					<th style="min-width:130px"><%:Name%></th>
+					<th><%:Connector token (leave blank to keep)%></th>
+					<th style="width:44px"></th>
+				</tr>
+			</thead>
+			<tbody id="cf-body">
+			<% for i, t in ipairs(tunnels) do %>
+				<tr>
+					<td><input type="checkbox" value="1" data-field="enabled" <%= t.enabled and "checked" or "" %> /></td>
+					<td><input type="text" data-field="name" value="<%=pcdata(t.name)%>" /></td>
+					<td><input type="password" data-field="token" class="cf-tok" value="" autocomplete="new-password"
+						placeholder="<%= t.has_token and translate("stored — leave blank to keep") or translate("paste connector token") %>" /></td>
+					<td><button type="button" class="cbi-button cbi-button-remove" onclick="cfRemoveRow(this)" title="<%:Remove%>">×</button></td>
+				</tr>
+			<% end %>
+			</tbody>
+		</table>
+
+		<div style="margin:10px 0">
+			<button type="button" class="cbi-button cbi-button-add" onclick="cfAddRow()"><%:Add tunnel%></button>
+		</div>
+	</div>
+</div>
+
+<div class="cbi-page-actions">
+	<input type="submit" class="cbi-button cbi-button-save" value="<%:Save & restart%>" />
+</div>
+</form>
+
+<div class="cbi-section">
+	<h3><%:How to connect a tunnel%></h3>
+	<div class="cbi-section-node">
+		<ol style="line-height:1.7">
+			<li><%:In the Cloudflare dashboard open%> <b>Zero Trust → Networks → Tunnels</b> <%:and create a tunnel of type%> <code>cloudflared</code>.</li>
+			<li><%:Choose%> <b>Linux</b> <%:as the environment and copy the token — it is the long string after%> <code>--token</code>.</li>
+			<li><%:Paste it in the table above, enable the row, then save. The connector dials out; no inbound firewall rule is needed.%></li>
+			<li><%:On the tunnel's%> <b>Public Hostname</b> <%:tab, add one entry per internal service, pointing at the LAN address of the host.%></li>
+		</ol>
+		<p class="cbi-map-descr"><%:Ingress for token-based tunnels is stored in Cloudflare, so hostnames added there take effect within seconds — the router does not need to be reconfigured.%></p>
+		<table class="cbi-section-table" style="max-width:640px">
+			<thead><tr><th><%:Public hostname%></th><th><%:Service URL%></th></tr></thead>
+			<tbody>
+				<tr><td class="cf-mono">router.example.com</td><td class="cf-mono">http://192.168.0.1</td></tr>
+				<tr><td class="cf-mono">nas.example.com</td><td class="cf-mono">http://192.168.0.50:5000</td></tr>
+			</tbody>
+		</table>
+		<p class="cbi-map-descr"><%:Keep%> <b>vpn.example.com</b> <span class="cf-mono">DNS only</span> — WireGuard UDP cannot go through the Cloudflare proxy. That record belongs to the Dynamic DNS tab.</p>
+	</div>
+</div>
+
+<script type="text/javascript">
+//<![CDATA[
+function cfRenumber() {
+	var rows = document.querySelectorAll('#cf-body tr');
+	document.getElementById('cf-count').value = rows.length;
+	for (var i = 0; i < rows.length; i++) {
+		var idx = i + 1;
+		var fields = rows[i].querySelectorAll('[data-field]');
+		for (var j = 0; j < fields.length; j++) {
+			fields[j].name = fields[j].getAttribute('data-field') + idx;
+		}
+	}
+}
+
+function cfAddRow() {
+	var body = document.getElementById('cf-body');
+	var tr = document.createElement('tr');
+	tr.innerHTML =
+		'<td><input type="checkbox" value="1" data-field="enabled" checked /></td>' +
+		'<td><input type="text" data-field="name" placeholder="<%= translate("e.g. router") %>" /></td>' +
+		'<td><input type="password" data-field="token" class="cf-tok" value="" autocomplete="new-password" placeholder="<%= translate("paste connector token") %>" /></td>' +
+		'<td><button type="button" class="cbi-button cbi-button-remove" onclick="cfRemoveRow(this)" title="<%= translate("Remove") %>">×</button></td>';
+	body.appendChild(tr);
+	cfRenumber();
+}
+
+function cfRemoveRow(btn) {
+	var row = btn.closest('tr');
+	if (row) row.parentNode.removeChild(row);
+	cfRenumber();
+}
+
+document.addEventListener('DOMContentLoaded', cfRenumber);
+//]]>
+</script>
+
+<%+footer%>

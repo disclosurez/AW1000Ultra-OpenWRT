@@ -1,0 +1,16 @@
+#!/bin/sh
+LOG=/data/logs/dns.log
+if [ -n "$1" ]; then
+	grep " from $1 " "$LOG" 2>/dev/null |
+		sed -n 's/.*query\[[^]]*\] \([^ ]*\) from .*/\1/p' |
+		sort | uniq -c | sort -rn | head -50
+else
+	awk '/query\[/ {
+		dom=""; ip="";
+		for (i = 1; i <= NF; i++) {
+			if ($i ~ /^query\[/) dom = $(i + 1);
+			if ($i == "from") ip = $(i + 1);
+		}
+		if (dom != "" && ip != "") print ip " " dom
+	}' "$LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -50
+fi

@@ -1,0 +1,241 @@
+<%+header%>
+<%
+local uci  = require "luci.model.uci".cursor()
+local fs   = require "nixio.fs"
+local sys  = require "luci.sys"
+local util = require "luci.util"
+local http = require "luci.http"
+local disp = require "luci.dispatcher"
+local pcdata = util.pcdata
+
+local function get(cfg, opt, default)
+	local v = uci:get(cfg, "main", opt)
+	if v == nil or v == "" then return default end
+	return v
+end
+
+local function read_dir(path)
+	local out = {}
+	local ok, d = pcall(fs.dir, path)
+	if not ok or not d then return out end
+	for name in d do
+		if name ~= "." and name ~= ".." then out[#out + 1] = name end
+	end
+	table.sort(out)
+	return out
+end
+
+local function iface_ip(dev)
+	local out = sys.exec("ip -4 addr show dev " .. dev .. " 2>/dev/null") or ""
+	return out:match("inet%s+([%d%.]+)/")
+end
+
+local enabled  = (get("wifi_guest", "enabled", "1") ~= "0")
+local portal   = (get("captiveportal", "enabled", "1") ~= "0")
+local gate     = get("captiveportal", "gate_iface", "br-guest")
+local port     = tonumber(get("captiveportal", "port", "8088")) or 8088
+local saved    = http.formvalue("saved")
+local guest_ifaces = uci:get_list("wifi_guest", "main", "ifaces") or {}
+
+local guest_ip = iface_ip("br-guest") or "192.168.5.1"
+local members  = read_dir("/sys/class/net/br-guest/brif")
+
+local dhcp_start, dhcp_end = "192.168.5.100", "192.168.5.249"
+local conf = fs.readfile("/tmp/dnsmasq.d/wifi-guest.conf") or ""
+local a, b = conf:match("dhcp%-range=set:wifi_guest,([%d%.]+),([%d%.]+)")
+if a and b then dhcp_start, dhcp_end = a, b end
+
+local portal_running = (sys.call("ps w | grep '[u]httpd' | grep -q 'www/portal'") == 0)
+local portal_url = "http://" .. guest_ip .. ":" .. port .. "/"
+local zone_input = uci:get("firewall", "wifi_guest", "input") or "?"
+local zone_forward = uci:get("firewall", "wifi_guest", "forward") or "?"
+
+-- Map the saved guest VIF names to their SSIDs and radio names.
+local ssids = {}
+local ok, mtkwifi = pcall(require, "mtkwifi")
+if ok and mtkwifi then
+	local ok2, devs = pcall(mtkwifi.get_all_devs)
+	if ok2 and devs then
+		local seen_dev = {}
+		for key, dev in pairs(devs) do
+			local devname = dev.devname or key
+			if devname and not seen_dev[devname] then
+				seen_dev[devname] = true
+				for _, vif in ipairs(dev.vifs or {}) do
+					local is_guest = false
+					for _, g in ipairs(guest_ifaces) do
+						if g == vif.vifname then is_guest = true; break end
+					end
+					if is_guest then
+						ssids[#ssids + 1] = {
+							ssid = vif.__ssid or vif.vifname,
+							ifname = vif.vifname,
+							devname = devname,
+							state = enabled and ((vif.state == "up") and "up" or "down") or "down",
+							href = disp.build_url("admin", "mtk", "wifi", "vif_cfg_view", devname, vif.vifname)
+						}
+					end
+				end
+			end
+		end
+	end
+end
+if #ssids == 0 then
+	for _, g in ipairs(guest_ifaces) do
+		ssids[#ssids + 1] = {
+			ssid = g, ifname = g, devname = "",
+			state = enabled and "?" or "down",
+			href = disp.build_url("admin", "mtk", "wifi")
+		}
+	end
+end
+table.sort(ssids, function(x, y) return x.ifname < y.ifname end)
+%>
+
+<style type="text/css">
+.gw-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+.gw-on   { background:#5cb85c; }
+.gw-off  { background:#d9534f; }
+.gw-warn { background:#f0ad4e; }
+.gw-mono { font-family:monospace; }
+.gw-note { margin:8px 0 0; }
+.gw-url  { font-family:monospace; background:#f3f4f6; border:1px solid #ddd; border-radius:6px; padding:6px 10px; display:inline-block; }
+</style>
+
+<h2 name="content"><%:Guest Wireless%></h2>
+
+<p class="cbi-map-descr">
+	<%:An isolated guest Wi-Fi network on its own bridge and subnet. Guests can reach the internet (and, if enabled, the captive portal), but not the LAN or the router management pages. The guest SSIDs are the ones with Guest network ticked in Wi-Fi configuration.%>
+</p>
+
+<% if saved then %>
+<div class="alert-message success" style="margin:10px 0;padding:8px 12px;background:#dff0d8;border:1px solid #d6e9c6;border-radius:4px">
+	<%:Saved. The guest SSIDs and captive portal were updated.%>
+</div>
+<% end %>
+
+<div class="cbi-section">
+	<h3><%:Status%></h3>
+	<div class="cbi-section-node">
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Guest wireless%></label>
+			<div class="cbi-value-field">
+				<% if enabled then %>
+					<span class="gw-dot gw-on"></span><%:enabled — guest SSIDs are isolated on%> <code>br-guest</code>
+				<% else %>
+					<span class="gw-dot gw-off"></span><%:disabled — the guest SSIDs are taken down%>
+				<% end %>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Guest bridge%></label>
+			<div class="cbi-value-field">
+				<code>br-guest</code> · <span class="gw-mono"><%=pcdata(guest_ip)%>/24</span>
+				<% if #members > 0 then %>
+					<div class="cbi-value-description"><%:Ports%>: <span class="gw-mono"><%=pcdata(table.concat(members, ", "))%></span></div>
+				<% else %>
+					<div class="cbi-value-description"><%:No guest VIFs attached yet.%></div>
+				<% end %>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Guest DHCP%></label>
+			<div class="cbi-value-field">
+				<span class="gw-mono"><%=pcdata(dhcp_start)%> – <%=pcdata(dhcp_end)%></span>
+				<div class="cbi-value-description"><%:Served by the main dnsmasq only while the guest bridge is up.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Captive portal%></label>
+			<div class="cbi-value-field">
+				<% if not portal then %>
+					<span class="gw-dot gw-off"></span><%:disabled — guests go straight online%>
+				<% elseif portal_running then %>
+					<span class="gw-dot gw-on"></span><%:enabled — running on%> <code><%=pcdata(gate)%></code>
+					<div class="cbi-value-description"><a href="<%=pcdata(portal_url)%>" target="_blank" rel="noopener"><%=pcdata(portal_url)%></a></div>
+				<% else %>
+					<span class="gw-dot gw-warn"></span><%:enabled but not running%>
+				<% end %>
+				<% if gate ~= "br-guest" then %>
+					<div class="cbi-value-description"><%:The portal is currently gated on%> <code><%=pcdata(gate)%></code><%:, not br-guest. Saving this page moves it to br-guest.%></div>
+				<% end %>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Firewall%></label>
+			<div class="cbi-value-field">
+				<% if zone_input == "REJECT" and zone_forward == "REJECT" then %>
+					<span class="gw-dot gw-on"></span><%:isolated — internet only, no LAN%>
+				<% else %>
+					<span class="gw-dot gw-warn"></span><%:zone wifi_guest is%> input <code><%=pcdata(zone_input)%></code>, forward <code><%=pcdata(zone_forward)%></code>
+				<% end %>
+			</div>
+		</div>
+	</div>
+</div>
+
+<div class="cbi-section">
+	<h3><%:Guest SSIDs%> <span class="cbi-section-descr" style="font-weight:400">(<%=#ssids%>)</span></h3>
+	<div class="cbi-section-node">
+		<% if #ssids == 0 then %>
+			<p><em><%:No guest SSIDs yet.%></em> <%:Open Wi-Fi configuration and tick%> <b><%:Guest network%></b> <%:on each SSID you want here.%></p>
+		<% else %>
+			<table class="cbi-section-table">
+				<thead><tr><th><%:SSID%></th><th><%:Interface%></th><th><%:Radio%></th><th><%:State%></th><th></th></tr></thead>
+				<tbody>
+				<% for _, s in ipairs(ssids) do %>
+					<tr>
+						<td><b><%=pcdata(s.ssid)%></b></td>
+						<td class="gw-mono"><%=pcdata(s.ifname)%></td>
+						<td class="gw-mono"><%=pcdata(s.devname ~= "" and s.devname or "—")%></td>
+						<td><% if s.state == "up" then %><span class="gw-dot gw-on"></span><%:up%><% else %><span class="gw-dot gw-off"></span><%=pcdata(s.state)%><% end %></td>
+						<td><a class="cbi-button" href="<%=pcdata(s.href)%>"><%:Edit%></a></td>
+					</tr>
+				<% end %>
+				</tbody>
+			</table>
+		<% end %>
+		<p class="gw-note"><a class="cbi-button" href="<%=url('admin/mtk/wifi')%>"><%:Open Wi-Fi configuration%></a></p>
+		<div class="cbi-value-description"><%:Tick Guest network on an SSID in Wi-Fi configuration to add it to this list. Unticking it moves that SSID back to the LAN.%></div>
+	</div>
+</div>
+
+<form method="post" action="<%=url('admin/mtk/guestwireless/save')%>" class="cbi-map">
+<input type="hidden" name="token" value="<%=token%>" />
+<div class="cbi-section">
+	<h3><%:Settings%></h3>
+	<div class="cbi-section-node">
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Guest wireless enabled%></label>
+			<div class="cbi-value-field">
+				<input type="checkbox" name="enabled" value="1" <%= enabled and "checked" or "" %> />
+				<div class="cbi-value-description"><%:When off, the guest VIFs are taken down and no guest traffic is allowed. The guest SSID list is kept.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Captive portal for guests%></label>
+			<div class="cbi-value-field">
+				<input type="checkbox" name="portal" value="1" <%= portal and "checked" or "" %> />
+				<div class="cbi-value-description"><%:Redirect guests on br-guest to the terms page before allowing internet access. This uses the settings on the Captive Portal page.%></div>
+			</div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Guest subnet%></label>
+			<div class="cbi-value-field"><code>192.168.5.0/24</code> · <code>br-guest</code></div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Firewall zone%></label>
+			<div class="cbi-value-field"><code>wifi_guest</code> · <%:DNS/DHCP/portal allowed; internet via WAN; no LAN%></div>
+		</div>
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Captive Portal settings%></label>
+			<div class="cbi-value-field"><a class="cbi-button" href="<%=url('admin/mtk/captiveportal')%>"><%:Open Captive Portal%></a></div>
+		</div>
+	</div>
+</div>
+<div class="cbi-page-actions">
+	<input type="submit" class="cbi-button cbi-button-save" value="<%:Save & apply%>" />
+</div>
+</form>
+
+<%+footer%>
