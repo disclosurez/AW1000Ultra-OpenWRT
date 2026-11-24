@@ -38,6 +38,103 @@
 			return `<tr${attrs}>${cells.map(c => String(c).startsWith('<td') ? c : td(c)).join('')}</tr>`;
 		}).join('')}</tbody></table></div>`;
 	}
+
+	/* Thermals + speedtest: mirrors the live console's two Overview cards. */
+	const THERMAL_GROUPS = [
+		['CPU cluster', 44.1], ['GPU', 44.6], ['PMIC rails', 43.2], ['Modem / RF', 42.9], ['DRAM', 43.8]
+	];
+	const THERMAL_ZONES = [
+		['soc', 44.2], ['CPU0', 43.9], ['CPU1', 44.1], ['CPU2', 43.6], ['CPU3', 43.8],
+		['gpu0', 44.6], ['gpu1', 44.4], ['dramc', 43.8], ['mmsys', 42.9], ['5G', 42.2],
+		['4G', 43.1], ['3G', 42.4], ['soc dram', 41.6], ['nrpa', 41.1], ['ltepa', 40.8],
+		['rf', 41.3], ['crystal', 41.9], ['pmic', 43.2], ['pmic vcore', 42.6],
+		['pmic vproc', 42.0], ['pmic vgpu', 41.4], ['RF', 41.2]
+	];
+
+	const tempBand = c => c >= 85 ? 'critical' : c >= 70 ? 'hot' : c >= 55 ? 'warm' : 'cool';
+	const tempPos = c => Math.max(1.5, Math.min(100, ((c - 25) / 70) * 100));
+
+	function sparkPath(vals, w = 232, h = 34, pad = 3) {
+		const lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+		const span = (hi - lo) < 1 ? 1 : hi - lo;
+		let d = '';
+		vals.forEach((v, i) => {
+			const x = (i * w) / (vals.length - 1);
+			const y = h - pad - ((v - lo) / span) * (h - pad * 2);
+			d += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + y.toFixed(1);
+		});
+		return { line: d, area: d + `L${w} ${h}L0 ${h}Z` };
+	}
+
+	function thermalSection() {
+		const max = 44.2;
+		const band = tempBand(max);
+		const spark = sparkPath([43.1, 43.4, 43.2, 43.8, 44.1, 43.9, 44.4, 44.2, 43.8, 44.0,
+			44.3, 44.1, 43.7, 43.9, 44.2, 44.6, 44.4, 44.1, 43.9, 44.2, 44.0, 43.8, 44.1, 44.2]);
+
+		const rows = THERMAL_GROUPS.map(([label, c]) =>
+			`<div class="thermal-row" data-band="${tempBand(c)}">
+				<span class="thermal-row-label">${label}</span>
+				<span class="thermal-row-bar"><i style="width:${tempPos(c).toFixed(1)}%"></i></span>
+				<span class="thermal-row-val mono">${c.toFixed(1)}°</span>
+			</div>`).join('');
+
+		const chips = THERMAL_ZONES.map(([name, c]) =>
+			`<span class="thermal-chip" data-band="${tempBand(c)}" title="${name}">${name} <b>${c.toFixed(1)}</b></span>`).join('');
+
+		return `<section class="thermal" data-band="${band}">
+			<div class="thermal-head"><span class="thermal-title">Thermals</span>
+				<span class="thermal-note">${THERMAL_ZONES.length} sensors · no throttling</span></div>
+			<div class="thermal-body">
+				<div class="thermal-main">
+					<div class="thermal-now"><span class="thermal-value mono">${max.toFixed(1)}</span><span class="thermal-unit">°C</span></div>
+					<div class="thermal-band">${band === 'cool' ? 'Cool' : band === 'warm' ? 'Warm' : band === 'hot' ? 'Hot' : 'Critical'}</div>
+					<div class="thermal-gauge"><span class="thermal-gauge-pin" style="left:${tempPos(max).toFixed(1)}%"></span></div>
+					<div class="thermal-scale"><span>25</span><span>55</span><span>75</span><span>95</span></div>
+					<div class="thermal-spark"><svg viewBox="0 0 232 34" preserveAspectRatio="none" aria-hidden="true">
+						<path class="thermal-spark-area" d="${spark.area}"/><path class="thermal-spark-line" d="${spark.line}"/></svg></div>
+					<div class="thermal-sub">peak 46.8° at 09:12</div>
+				</div>
+				<div class="thermal-groups">${rows}</div>
+			</div>
+			<div class="thermal-chips">${chips}</div>
+		</section>`;
+	}
+
+	const fmtMbps = bps => bps ? (bps / 1e6).toFixed(bps >= 1e8 ? 0 : 1) : '—';
+	function agoLabel(sec) {
+		if (!sec && sec !== 0) return '';
+		if (sec < 60) return 'just now';
+		if (sec < 3600) return Math.round(sec / 60) + 'm ago';
+		if (sec < 86400) return Math.round(sec / 3600) + 'h ago';
+		return Math.round(sec / 86400) + 'd ago';
+	}
+
+	function speedSection() {
+		const rows = ['isp', 'sim'].map(link => {
+			const r = state.speed[link];
+			const running = state.speedRunning === link;
+			const stateName = running ? 'running' : (r ? 'ok' : 'none');
+			const figs = r
+				? `<span class="speed-fig"><b class="mono">${fmtMbps(r.down)}</b><i>Mbps ↓</i></span>
+					<span class="speed-fig"><b class="mono">${fmtMbps(r.up)}</b><i>Mbps ↑</i></span>
+					<span class="speed-fig"><b class="mono">${r.ping}</b><i>ms</i></span>`
+				: '<span class="speed-fig speed-none">—</span><span class="speed-fig speed-none">—</span><span class="speed-fig speed-none">—</span>';
+			return `<div class="speed-row" data-link="${link}" data-state="${stateName}">
+				<span class="speed-link">${link.toUpperCase()}</span>
+				${figs}
+				<span class="speed-meta">${r ? `${r.server} · ${r.isp} · ~${r.mb} MB` : 'no test recorded yet'}</span>
+				<span class="speed-age">${r ? agoLabel(r.age) : ''}</span>
+				<button type="button" class="speed-run" data-action="speed-run" data-link="${link}"${running ? ' disabled' : ''}>${running ? 'Testing…' : 'Run'}</button>
+			</div>`;
+		}).join('');
+
+		return `<section class="speed">
+			<div class="speed-head"><span class="speed-title">Speed tests</span>
+				<span class="speed-note">${state.speedRunning ? 'testing — about 30 s, uses real data' : 'speedtest.net · runs on failover'}</span></div>
+			<div class="speed-rows">${rows}</div>
+		</section>`;
+	}
 	function empty(title, text, iconId = 'i-grid') {
 		return `<div class="demo-empty">${icon(iconId)}<b>${title}</b><span>${text}</span></div>`;
 	}
@@ -740,6 +837,8 @@
 						<a class="uplink" data-state="parked" href="#/interfaces"><span class="uplink-dot"></span><span class="uplink-name">SIM6</span><span class="uplink-proto">DHCPV6</span><span class="uplink-addr">no address</span><span class="uplink-badge">Parked</span></a>
 					</div>
 				</section>
+				${thermalSection()}
+				${speedSection()}
 			</div>
 			<div class="demo-grid three">
 				${card('System', kv([
@@ -767,6 +866,31 @@
 				td('work-laptop') + td('192.168.1.33', 'mono') + td('02:00:00:00:00:33', 'mono') + td('7h 04m'),
 				td('phone') + td('192.168.1.44', 'mono') + td('02:00:00:00:00:44', 'mono') + td('5h 56m')
 			]))}`;
+		},
+		init() {
+			actions['speed-run'] = el => {
+				const link = el.dataset.link;
+				if (state.speedRunning) return;
+				state.speedRunning = link;
+				rerender();
+				toast(`Speed test started on ${link.toUpperCase()} — a real run moves ~200 MB.`);
+				setTimeout(() => {
+					const base = link === 'isp' ? 116 : 61;
+					const wobble = (Math.random() - 0.5) * 9;
+					state.speed[link] = {
+						down: Math.round((base + wobble) * 1e6),
+						up: Math.round((link === 'isp' ? 41 : 21) * 1e6),
+						ping: link === 'isp' ? 4.2 : 38,
+						mb: link === 'isp' ? 194 : 96,
+						server: link === 'isp' ? 'Slough' : 'Reading',
+						isp: link === 'isp' ? 'toob' : 'EE',
+						age: 0
+					};
+					state.speedRunning = null;
+					rerender();
+					toast(`Speed test finished on ${link.toUpperCase()} (mock).`);
+				}, 2800);
+			};
 		}
 	};
 

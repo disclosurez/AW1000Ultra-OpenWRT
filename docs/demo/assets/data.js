@@ -1,6 +1,10 @@
 /* Fictional demo data. No live router values, client records or secrets. */
 window.DEMO_DATA = {
 	host: { name: 'AW1000-Ultra', model: 'AW1000 ULTRA', firmware: 'OpenWrt 19.07.7', lan: '192.168.1.1' },
+	speed: {
+		isp: { down: 116394000, up: 41200000, ping: 4.2, mb: 194, server: 'Slough', isp: 'toob', age: 7200 },
+		sim: null
+	},
 	wan: {
 		ip: '203.0.113.10', gateway: '203.0.113.1',
 		dns: ['203.0.113.53', '203.0.113.54'],

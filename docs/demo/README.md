@@ -20,7 +20,9 @@ push to `main`.
 The demo has **56 views**. It mirrors the custom pages and the stock menu
 pages that a real installation exposes:
 
-- **Custom console:** Overview, WAN strip, Interfaces / Physical ports,
+- **Custom console:** Overview (live hero, WAN strip, a **Thermals** card with
+  a SoC gauge, 6 h sparkline and per-zone chips, and a **Speed tests** card
+  whose Run buttons replay a mock speedtest), Interfaces / Physical ports,
   Parental Control (rules, domains, devices and scopes), Status → Devices &
   Activity, Guest Wireless (Overview / Devices / Logs), one-tap Captive Portal
   splash preview, Cloudflare, SIEM, VPN split tunnel, LED Configuration,
