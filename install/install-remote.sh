@@ -286,6 +286,14 @@ if [ "${WITH_WANFAILOVER:-1}" = 1 ]; then
 	# Secret file: never overwritten once it exists (it holds the bot token).
 	[ -f /etc/wan-notify.conf ] || put "$SRC/system/wan-notify.conf" /etc/wan-notify.conf 0600
 	cron_add '0 9 * * * /usr/sbin/wan-notify heartbeat >/dev/null 2>&1'
+
+	log "throughput measurements"
+	put "$SRC/system/sbin/netspeed" /usr/sbin/netspeed 0755
+	put "$SRC/luci/controller/netspeed.lua" /usr/lib/lua/luci/controller/netspeed.lua 0644
+	seed netspeed "$SRC/uci/netspeed"
+	mkdir -p /data/netspeed/bin
+	[ -x /data/netspeed/bin/speedtest-go ] || \
+		log "warning: /data/netspeed/bin/speedtest-go missing - automatic tests will be skipped"
 	/etc/init.d/wanfailover enable
 	/etc/init.d/wanfailover restart 2>/dev/null || \
 		log "warning: failover started but no isp uplink yet (see docs/INSTALL.md §4)"

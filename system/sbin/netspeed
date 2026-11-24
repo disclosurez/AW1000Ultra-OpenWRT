@@ -1,0 +1,180 @@
+#!/bin/sh
+# netspeed — speedtest.net measurements from the router, per uplink.
+#
+#   netspeed now [isp|sim]    run one test immediately (manual, unthrottled)
+#   netspeed auto <isp|sim>   called by wan-failover: respects the interval
+#   netspeed status           last result per link
+#   netspeed list             nearest speedtest.net servers
+#
+# Results are appended to /data/netspeed/results.tsv and the latest per-link
+# JSON is rewritten for the Status page. A test is a real 10 s download and a
+# 10 s upload, so it moves ~50-250 MB: that is why auto runs are throttled per
+# link and the SIM has its own interval and an optional data guard.
+
+BIN=/data/netspeed/bin/speedtest-go
+DATA=/data/netspeed
+TSV=$DATA/results.tsv
+LOCK=/tmp/netspeed.lock
+STATUS=/tmp/netspeed.status
+FAIL=/tmp/wanfailover.status
+LOG=/tmp/netspeed.log
+
+TAG=netspeed
+
+uci_g() { uci -q get "netspeed.settings.$1" 2>/dev/null; }
+
+log() {
+	logger -t "$TAG" "$*"
+	echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG"
+	if [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 16384 ]; then
+		tail -c 8192 "$LOG" > "$LOG.t" && mv "$LOG.t" "$LOG"
+	fi
+}
+
+read_status() { sed -n "s/^$1=//p" "$FAIL" 2>/dev/null; }
+
+dev_for() {
+	case "$1" in
+	isp) read_status wan_device ;;
+	sim) read_status modem_device ;;
+	esac
+}
+
+last_ts() { # last_ts <link>
+	awk -F'\t' -v l="$1" '$2 == l { t = $1 } END { print t }' "$TSV" 2>/dev/null
+}
+
+sim_mb_24h() {
+	awk -F'\t' -v since="$(( $(date +%s) - 86400 ))" \
+		'$2 == "sim" && $1 >= since { s += $10 } END { printf "%d", s }' "$TSV" 2>/dev/null
+}
+
+run_test() { # run_test <link>
+	local link=$1 dev json rc ts rx0 tx0 rx1 tx1 mb srv dl ul ping jitter sname isp ip
+	dev=$(dev_for "$link")
+	[ -n "$dev" ] || { log "$link: cannot resolve a device"; return 1; }
+	[ -r "/sys/class/net/$dev/statistics/rx_bytes" ] || { log "$link: $dev is not up"; return 1; }
+	[ "$(read_status state)" = "$link" ] || { log "$link: not the active uplink, skipped"; return 1; }
+	[ -x "$BIN" ] || { log "missing $BIN"; return 1; }
+
+	if ! mkdir "$LOCK" 2>/dev/null; then
+		log "another test is already running"
+		return 1
+	fi
+	trap 'rmdir "$LOCK" 2>/dev/null' EXIT INT TERM
+
+	echo "running link=$link started=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATUS"
+	log "starting $link test on $dev"
+
+	json=/tmp/netspeed.json
+	srv=$(uci_g server)
+	if [ -n "$srv" ]; then
+		timeout 180 "$BIN" --json --source "$dev" --server "$srv" > "$json" 2>/tmp/netspeed.err
+	else
+		timeout 180 "$BIN" --json --source "$dev" > "$json" 2>/tmp/netspeed.err
+	fi
+	rc=$?
+
+	if [ "$rc" != 0 ] || [ ! -s "$json" ]; then
+		log "$link: test failed (rc=$rc) $(head -c 120 /tmp/netspeed.err 2>/dev/null)"
+		rm -f "$STATUS"
+		return 1
+	fi
+
+	jf() { jsonfilter -i "$json" -e "$1" 2>/dev/null | head -1; }
+	dl=$(jf '@.servers[0].dl_speed')
+	ul=$(jf '@.servers[0].ul_speed')
+	lat=$(jf '@.servers[0].latency')
+	jit=$(jf '@.servers[0].jitter')
+	dlns=$(jf '@.servers[0].test_duration.download')
+	ulns=$(jf '@.servers[0].test_duration.upload')
+	sname=$(jf '@.servers[0].name')
+	isp=$(jf '@.user_info.Isp')
+	ip=$(jf '@.user_info.IP')
+
+	[ -n "$dl" ] || { log "$link: test produced no data"; rm -f "$STATUS" "$json"; return 1; }
+
+	# bps -> integer, ns -> ms with one decimal
+	dl=$(awk -v v="$dl" 'BEGIN { printf "%d", v + 0.5 }')
+	ul=$(awk -v v="$ul" 'BEGIN { printf "%d", v + 0.5 }')
+	ping=$(awk -v v="$lat" 'BEGIN { printf "%.1f", v / 1000000 }')
+	jitter=$(awk -v v="$jit" 'BEGIN { printf "%.1f", v / 1000000 }')
+	ts=$(date +%s)
+	sname=$(printf '%s' "$sname" | sed 's/\t/ /g')
+
+	# Volume of the test itself. Interface counters cannot be used: eth1 also
+	# carries every other client on the LAN, so the delta over 30 s says nothing
+	# about this transfer.
+	mb=$(awk -v d="$dl" -v dn="$dlns" -v u="$ul" -v un="$ulns" \
+		'BEGIN { printf "%d", (d * dn + u * un) / 8e15 }')
+
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$ts" "$link" "$dl" "$ul" "$ping" "$jitter" "$sname" "$isp" "$ip" "$mb" >> "$TSV"
+
+	# keep the history bounded (2 000 tests is years of data)
+	if [ "$(wc -l < "$TSV")" -gt 2000 ]; then
+		tail -n 2000 "$TSV" > "$TSV.t" && mv "$TSV.t" "$TSV"
+	fi
+
+	printf '{"link":"%s","ts":%s,"down":%s,"up":%s,"ping":%s,"jitter":%s,"server":"%s","isp":"%s","ip":"%s","mb":%s}\n' \
+		"$link" "$ts" "$dl" "$ul" "$ping" "$jitter" "$sname" "$isp" "$ip" "$mb" \
+		> "$DATA/latest.$link.json"
+
+	rm -f "$STATUS" "$json"
+	log "$link: $(awk -v v="$dl" 'BEGIN{printf "%.1f", v/1000000}') Mbps down, $(awk -v v="$ul" 'BEGIN{printf "%.1f", v/1000000}') Mbps up, ${ping} ms, ${mb} MB used"
+}
+
+auto_test() { # auto_test <link>
+	local link=$1 iv delay guard used last now
+	[ "$(uci_g enabled)" = "0" ] && return 0
+	[ "$(uci_g run_on_$link)" = "0" ] && return 0
+
+	iv=$(uci_g interval_$link)
+	[ -n "$iv" ] || iv=21600
+	last=$(last_ts "$link")
+	now=$(date +%s)
+	if [ -n "$last" ] && [ $(( now - last )) -lt "$iv" ]; then
+		log "$link: last test $(( now - last ))s ago, interval ${iv}s — skipped"
+		return 0
+	fi
+
+	delay=$(uci_g delay); [ -n "$delay" ] || delay=60
+	sleep "$delay"
+
+	# the uplink may have flipped back while we waited
+	[ "$(read_status state)" = "$link" ] || { log "$link: gone before the test started"; return 0; }
+
+	guard=$(uci_g data_guard_mb)
+	if [ "$link" = sim ] && [ -n "$guard" ] && [ "$guard" -gt 0 ]; then
+		used=$(sim_mb_24h)
+		if [ $(( used + 150 )) -gt "$guard" ]; then
+			log "sim: data guard hit (${used} MB in 24 h, guard ${guard} MB) — skipped"
+			return 0
+		fi
+	fi
+
+	run_test "$link"
+}
+
+case "$1" in
+now)
+	run_test "${2:-$(read_status state)}"
+	;;
+auto)
+	auto_test "$2"
+	;;
+status)
+	[ -s "$TSV" ] || { echo "no tests yet ($TSV)"; exit 0; }
+	printf '%-4s %-19s %10s %10s %7s %7s  %s\n' LINK WHEN DOWN UP PING JITTER SERVER
+	awk -F'\t' '{ printf "%-4s %-19s %7.1f Mb %7.1f Mb %5s ms %5s ms  %s (%s Mb)\n", \
+		toupper($2), strftime("%Y-%m-%d %H:%M", $1, 1), $3/1000000, $4/1000000, $5, $6, $7, $10 }' "$TSV" | tail -10
+	;;
+list)
+	[ -x "$BIN" ] || { echo "missing $BIN" >&2; exit 1; }
+	"$BIN" --list | head -20
+	;;
+*)
+	echo "usage: $0 now [isp|sim] | auto <isp|sim> | status | list" >&2
+	exit 1
+	;;
+esac

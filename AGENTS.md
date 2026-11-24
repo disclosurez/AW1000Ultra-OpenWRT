@@ -235,6 +235,46 @@ Getting the token: Telegram → **@BotFather** → `/newbot` → name + username
 ending in `bot` → paste the token into `TG_TOKEN`; open the bot, press START,
 send anything, then run `wan-notify chatid` and put that in `TG_CHAT`.
 
+### 1e. Throughput measurements (speedtest.net)
+
+A real speed test runs when an uplink comes online, and on demand from
+**Status → Overview**.
+
+| File | Role |
+|---|---|
+| `/data/netspeed/bin/speedtest-go` | static Go binary, v1.8.3, `Linux_arm64` release (Ookla's own CLI 403s this IP) |
+| `/usr/sbin/netspeed` | `now [isp\|sim]` · `auto <link>` · `status` · `list` |
+| `/etc/config/netspeed` | `enabled`, `run_on_isp`, `run_on_sim`, `interval_*`, `delay`, `data_guard_mb`, `server` |
+| `/usr/sbin/wan-failover` | `speedprobe <link>` after every transition (detached) |
+| `/data/netspeed/results.tsv` | one row per test: epoch, link, down, up, ping, jitter, server, isp, ip, MB |
+| `/data/netspeed/latest.<link>.json` | what the Status card and JSON endpoint read |
+| `admin/status/netspeed` | GET = state, POST `action=run&link=…` (+ CSRF token) = start a test |
+
+**A test moves real data.** 20 s of transfer measured 194 MB on a 116/39 Mbps
+line. That is why:
+
+- automatic runs are throttled per link (`interval_isp` 6 h, `interval_sim`
+  24 h) and there is a 60 s settle delay so a flap does not saturate the new
+  link;
+- `data_guard_mb` can stop SIM tests once that much has been spent on them in
+  24 h (default 0 = off);
+- the volume reported is the test's own `speed × duration`, **not** an
+  interface counter — `eth1` also carries every LAN client, so a counter delta
+  over 30 s is meaningless (it reported 1.7 GB for a 200 MB test).
+
+Only the active uplink can be tested: a parked SIM has no data path, so
+`netspeed now sim` refuses unless `wanfailover.status` says `state=sim`.
+
+```bash
+/usr/sbin/netspeed now isp       # manual, ignores the interval
+/usr/sbin/netspeed status        # last 10 results
+/usr/sbin/netspeed list          # nearest servers (fill in `server` to pin one)
+logread -e netspeed | tail
+```
+
+Results are **not** in `Statistics → Graphs` — temperature/throughput series
+would need collectd plugins the installed 5.11 does not have.
+
 ### 2. Parental control
 
 | File | Role |
@@ -1253,6 +1293,23 @@ probe-*.sh, test-*.sh                                                     ad-hoc
 ```
 
 ## Changelog
+
+- **2026-11-24** — **Throughput measurements + a real theme bug.** Status →
+  Overview gains a **Speed tests** card and every uplink transition triggers a
+  measurement (`wan-failover` → `netspeed auto <link>`, detached and throttled
+  per link). The test is `speedtest-go` (static Go, speedtest.net servers —
+  Ookla's own CLI is 403 on this network) run against the active interface;
+  results land in `/data/netspeed/results.tsv` plus `latest.<link>.json`, and a
+  **Run** button per row starts one manually through `admin/status/netspeed`
+  (POST + CSRF token, returns immediately, the card polls). Because a test
+  moves ~200 MB, automatic runs respect `interval_isp` (6 h) / `interval_sim`
+  (24 h), a 60 s settle delay and an optional `data_guard_mb`; the reported
+  volume is the test's own `speed × duration`, since interface counters also
+  carry every LAN client. Also fixed: the console theme gave up decorating the
+  overview after 9.6 s, so a cold module cache (10 s+ view render) left the page
+  completely unstyled with no hero — it now watches `#view` with a
+  MutationObserver and decorates whenever the view finally lands. See §1e.
+
 
 - **2026-11-24** — **Thermals on the Overview page.** The console theme's
   Overview gains a **Thermals** card fed by a new `thermal` block in

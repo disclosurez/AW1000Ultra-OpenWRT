@@ -281,6 +281,126 @@
 		'</div>';
 	}
 
+	/* ----------------------------------------------------------- speedtest */
+
+	var SPEED_ENDPOINT = (window.L && L.url) ? L.url('admin/status/netspeed') : '/cgi-bin/luci/admin/status/netspeed';
+	var speed = null;
+	var speedTimer = null;
+	var speedPending = null;
+
+	function speedMarkup() {
+		return '' +
+		'<div class="speed-head">' +
+			'<span class="speed-title">Speed tests</span>' +
+			'<span class="speed-note" data-k="speed-note">speedtest.net</span>' +
+		'</div>' +
+		'<div class="speed-rows" data-k="speed-rows"></div>';
+	}
+
+	function fmtMbps(bps) {
+		bps = +bps || 0;
+		if (!bps) return '—';
+		return (bps / 1000000).toFixed(bps >= 100000000 ? 0 : 1);
+	}
+
+	function fmtAgo(ts) {
+		var s = Math.max(0, Math.round(Date.now() / 1000) - (ts || 0));
+		if (s < 60) return 'just now';
+		if (s < 3600) return Math.round(s / 60) + 'm ago';
+		if (s < 86400) return Math.round(s / 3600) + 'h ago';
+		return Math.round(s / 86400) + 'd ago';
+	}
+
+	function speedEl(tag, cls, text) {
+		var n = doc.createElement(tag);
+		if (cls) n.className = cls;
+		if (text != null) n.textContent = text;
+		return n;
+	}
+
+	function speedFig(value, unit) {
+		var wrap = speedEl('span', 'speed-fig');
+		wrap.appendChild(speedEl('b', 'mono', value));
+		wrap.appendChild(speedEl('i', null, unit));
+		return wrap;
+	}
+
+	function speedRow(link, res, running) {
+		var row = speedEl('div', 'speed-row');
+		row.setAttribute('data-link', link);
+		row.setAttribute('data-state', running ? 'running' : (res ? 'ok' : 'none'));
+
+		/* Column order must match the CSS grid: link, 3 figures, meta, age, button. */
+		row.appendChild(speedEl('span', 'speed-link', link.toUpperCase()));
+		if (res) {
+			row.appendChild(speedFig(fmtMbps(res.down), 'Mbps ↓'));
+			row.appendChild(speedFig(fmtMbps(res.up), 'Mbps ↑'));
+			row.appendChild(speedFig(res.ping != null ? String(res.ping) : '—', 'ms'));
+		} else {
+			for (var i = 0; i < 3; i++) row.appendChild(speedEl('span', 'speed-fig speed-none', '—'));
+		}
+
+		var meta = speedEl('span', 'speed-meta',
+			res ? [res.server, res.isp, res.mb ? '~' + res.mb + ' MB' : null].filter(Boolean).join(' · ')
+			    : 'no test recorded yet');
+		if (res) {
+			meta.title = (res.ip || '') + ' via ' + (res.server || '')
+				+ ' · ' + new Date(res.ts * 1000).toLocaleString();
+		}
+		row.appendChild(meta);
+		row.appendChild(speedEl('span', 'speed-age', res ? fmtAgo(res.ts) : ''));
+
+		var btn = speedEl('button', 'speed-run', running ? 'Testing…' : 'Run');
+		btn.type = 'button';
+		btn.disabled = !!running;
+		btn.addEventListener('click', function () { runSpeed(link); });
+		row.appendChild(btn);
+		return row;
+	}
+
+	function renderSpeed(data) {
+		if (!speed || !data) return;
+		var host = $('[data-k="speed-rows"]', speed);
+		if (!host) return;
+
+		var note = $('[data-k="speed-note"]', speed);
+		if (note) {
+			note.textContent = data.running
+				? 'testing — about 30 s, uses real data'
+				: 'speedtest.net · runs on failover';
+		}
+
+		host.innerHTML = '';
+		host.appendChild(speedRow('isp', data.isp, !!data.running && speedPending === 'isp'));
+		host.appendChild(speedRow('sim', data.sim, !!data.running && speedPending === 'sim'));
+
+		if (data.running) scheduleSpeedPoll(3000);
+	}
+
+	function fetchSpeed() {
+		return fetch(SPEED_ENDPOINT, { credentials: 'same-origin', cache: 'no-store' })
+			.then(function (r) { return r.ok ? r.json() : null; })
+			.then(function (d) { if (d) renderSpeed(d); return d; })
+			.catch(function () {});
+	}
+
+	function scheduleSpeedPoll(ms) {
+		if (speedTimer) clearTimeout(speedTimer);
+		speedTimer = setTimeout(fetchSpeed, ms);
+	}
+
+	function runSpeed(link) {
+		speedPending = link;
+		var body = 'action=run&link=' + encodeURIComponent(link)
+			+ '&token=' + encodeURIComponent((window.L && L.env && L.env.token) || '');
+		fetch(SPEED_ENDPOINT, {
+			method: 'POST',
+			credentials: 'same-origin',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: body
+		}).then(fetchSpeed).catch(function () { speedPending = null; });
+	}
+
 	/* ------------------------------------------------------------- thermals */
 
 	var THERMAL_GROUPS = [
@@ -487,6 +607,13 @@
 		if (uplinks.nextSibling) view.insertBefore(thermal, uplinks.nextSibling);
 		else view.appendChild(thermal);
 
+		speed = doc.createElement('section');
+		speed.id = 'console-speed';
+		speed.className = 'speed';
+		speed.innerHTML = speedMarkup();
+		if (thermal.nextSibling) view.insertBefore(speed, thermal.nextSibling);
+		else view.appendChild(speed);
+
 		$$('.hstat', hero).forEach(function (a) {
 			var u = a.getAttribute('data-href');
 			if (u) a.setAttribute('href', (window.L && L.url) ? L.url(u) : '/cgi-bin/luci/' + u);
@@ -652,6 +779,7 @@
 
 	function renderHero(data) {
 		if (!hero) return;
+		fetchSpeed();
 		var wan = data.wan || {};
 		var up = !!wan.up;
 
@@ -725,7 +853,12 @@
 
 	var bootedOverview = false;
 	var viewTries = 0;
+	var viewObserver = null;
 
+	/* The vendor view is rendered client-side from an RPC round trip, which on
+	   this box can take 10 s or more on a cold module cache. A fixed number of
+	   retries silently gave up and left the page undecorated, so watch the node
+	   instead: decorate as soon as the sections exist, however long that takes. */
 	function waitForView() {
 		var view = $('#view');
 		if (view && view.querySelector('.cbi-section')) {
@@ -733,8 +866,19 @@
 			renderHeroFromPoll();
 			return;
 		}
-		if (++viewTries > 80) return;
-		setTimeout(waitForView, 120);
+		if (view && !viewObserver && window.MutationObserver) {
+			viewObserver = new MutationObserver(function () {
+				if (view.querySelector('.cbi-section')) {
+					viewObserver.disconnect();
+					viewObserver = null;
+					decorate(view);
+					renderHeroFromPoll();
+				}
+			});
+			viewObserver.observe(view, { childList: true, subtree: true });
+		}
+		if (++viewTries > 600) return;   /* ~2 minutes, then give up quietly */
+		setTimeout(waitForView, 200);
 	}
 
 	function renderHeroFromPoll() {

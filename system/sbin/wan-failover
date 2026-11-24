@@ -258,6 +258,14 @@ notify() { # notify <mode> [state] [reason]
 	( /usr/sbin/wan-notify "$@" >/dev/null 2>&1 & )
 }
 
+# Measure what the new link can actually do. Detached and self-throttled: the
+# interval lives in /etc/config/netspeed, so a flapping uplink cannot turn into
+# a stream of 20 s transfers.
+speedprobe() { # speedprobe <isp|sim>
+	[ -x /usr/sbin/netspeed ] || return 0
+	( /usr/sbin/netspeed auto "$1" >/dev/null 2>&1 & )
+}
+
 write_status() {
 	{
 		echo "state=$STATE"
@@ -365,12 +373,14 @@ run_loop() {
 					prev=$SINCE
 					STATE=isp; SINCE=$(now)
 					notify init isp "watchdog restart" "$prev"
+					speedprobe isp
 				fi
 			elif [ "$fails" -ge "$FAIL_TRIES" ]; then
 				if prefer_sim "startup probe: ISP unreachable"; then
 					prev=$SINCE
 					STATE=sim; SINCE=$(now)
 					notify init sim "watchdog restart" "$prev"
+					speedprobe sim
 				fi
 			fi
 			;;
@@ -380,6 +390,7 @@ run_loop() {
 					prev=$SINCE
 					STATE=sim; SINCE=$(now)
 					notify sim "ISP down ${fails}x" "$prev"
+					speedprobe sim
 				fi
 			else
 				# ISP healthy: keep our metric on top and the SIM parked
@@ -393,6 +404,7 @@ run_loop() {
 					prev=$SINCE
 					STATE=isp; SINCE=$(now)
 					notify isp "ISP recovered ${oks}x" "$prev"
+					speedprobe isp
 				fi
 			else
 				set_route "$MODEM_DEV" "$(dev_gw "$MODEM_DEV")" "$SIM_UP"

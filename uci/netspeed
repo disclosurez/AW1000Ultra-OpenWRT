@@ -1,0 +1,29 @@
+# Seed for /etc/config/netspeed — written only if the file does not exist.
+#
+# Speed tests run from the router against speedtest.net (speedtest-go) when an
+# uplink comes online, and on demand from Status -> Overview.
+#
+# A test moves real data: ~150-250 MB on a fast wired line, and whatever the
+# mobile link can pull in ~20 s on the SIM. Keep interval_sim generous.
+
+config settings 'settings'
+	# Master switch for the automatic (failover-triggered) runs only.
+	# A test started by hand always runs.
+	option enabled '1'
+
+	option run_on_isp '1'
+	option run_on_sim '1'
+
+	# Minimum spacing between automatic tests, per link (seconds).
+	option interval_isp '21600'
+	option interval_sim '86400'
+
+	# Let the new uplink settle before saturating it.
+	option delay '60'
+
+	# Stop automatic SIM tests once this many MB have been spent on them in the
+	# last 24 h. 0 disables the guard.
+	option data_guard_mb '0'
+
+	# Optional fixed server id (netspeed list). Empty picks the nearest.
+	option server ''
