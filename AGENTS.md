@@ -208,8 +208,12 @@ does not go unnoticed.
   watchdog **restart** that leaves the uplink somewhere other than the last
   reported state does send — otherwise the last alert keeps lying (e.g. a
   manual `ifup isp` flips to SIM, then the restart returns to ISP silently).
-- The message goes out over whichever uplink just came up, so a switch *to* the
-  SIM is reported over the SIM.
+- The message names the SIM link address, the ISP address, and the **public
+  egress** — the carrier's NAT address is not an interface address, so it is
+  asked from `cloudflare.com/cdn-cgi/trace` at send time and simply omitted if
+  that lookup fails.
+- It goes out over whichever uplink just came up, so a switch *to* the SIM is
+  reported over the SIM (and carries the carrier's address).
 - `MUTE` (default 300 s) keeps a flapping ISP from pinging every cycle; held-back
   switches are counted and appended to the next message (`+3 suppressed`).
 - Delivery retries 3× at 5 s, `-4` + 10 s timeout, because DNS can be stale for a
@@ -1242,7 +1246,10 @@ probe-*.sh, test-*.sh                                                     ad-hoc
   so a slow API can never stall the probe loop; a 5-minute cooldown stops a
   flapping ISP from pinging every cycle and counts what it held back. The
   `init` path is silent, so a reboot does not notify. A daily `heartbeat`
-  cron line acts as a dead-man's switch: no message = no router. See §1d.
+  cron line acts as a dead-man's switch: no message = no router. The push also
+  names the **public egress** address (asked from `cloudflare.com/cdn-cgi/trace`
+  at send time): the carrier's NAT address on the SIM is not an interface
+  address, so nothing local knows it. See §1d.
 
 - **2026-11-24** — **Web viewer: escaped clicks fixed, no browsing record.**
   Clicking a link or a search result inside the viewer could land on the router

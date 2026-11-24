@@ -84,8 +84,18 @@ send_retry() { # send_retry <text>
 	return 1
 }
 
+pub_ip() { # public egress address of whatever uplink is currently active
+	local ip
+	ip=$(curl -4 -s -m 6 https://cloudflare.com/cdn-cgi/trace 2>/dev/null \
+		| sed -n 's/^ip=//p' | head -1)
+	case "$ip" in
+	''|*[!0-9.]*) ip='' ;;
+	esac
+	echo "$ip"
+}
+
 compose() { # compose <state> <reason>
-	local st=$1 why=$2 head wip mip
+	local st=$1 why=$2 head wip mip pub
 	case "$st" in
 	sim) head='📶 Uplink → SIM (mobile data)' ;;
 	isp) head='🔌 Uplink → ISP (wired)' ;;
@@ -94,17 +104,21 @@ compose() { # compose <state> <reason>
 	wip=$(sval wan_ip); mip=$(sval modem_ip)
 	[ -n "$wip" ] || wip=-
 	[ -n "$mip" ] || mip=-
-	printf '%s\nreason: %s\nSIM: %s · ISP: %s\n%s' \
-		"$head" "${why:-manual}" "$mip" "$wip" "$(now)"
+	pub=$(pub_ip)
+	printf '%s\nreason: %s\nSIM: %s · ISP: %s' \
+		"$head" "${why:-manual}" "$mip" "$wip"
+	[ -n "$pub" ] && printf '\npublic: %s' "$pub"
+	printf '\n%s' "$(now)"
 }
 
 compose_hb() {
-	local st since
-	st=$(sval state); since=$(sval since)
+	local st since pub
+	st=$(sval state); since=$(sval since); pub=$(pub_ip)
 	[ -n "$st" ] || st=unknown
 	[ -n "$since" ] || since=-
 	printf '✅ Router alive · uplink %s\nsince %s · %s' \
 		"$(echo "$st" | tr 'a-z' 'A-Z')" "$since" "$(now)"
+	[ -n "$pub" ] && printf ' · public %s' "$pub"
 }
 
 # A flapping ISP can switch every 30 s; keep at most one message per MUTE
