@@ -43,11 +43,20 @@ const (
 	homePath   = "/"
 	assetRoute = "/raw"
 	pageRoute  = "/go"
+	// targetParam carries the proxied URL. It is deliberately unlikely to
+	// collide with a site's own field names (unlike "u", which some sites use
+	// for a username).
+	targetParam = "wv_u"
 )
 
 type session struct {
 	client *http.Client
 	last   time.Time
+	// base is the last page this browser session opened, used only to resolve
+	// navigations that escaped the rewriter (client-side JavaScript building
+	// root-relative URLs). It lives in RAM, is never logged, never written to
+	// flash and disappears with the session.
+	base *url.URL
 }
 
 var (
@@ -70,12 +79,31 @@ func main() {
 	go cleanupSessions()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", handleHome)
-	mux.HandleFunc(pageRoute, handlePage)
-	mux.HandleFunc(assetRoute, handleAsset)
-	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Privacy: the viewer keeps no history. Nothing is written to disk,
+		// URLs are never logged, and every response tells the browser not to
+		// store it or send the upstream page to a third party (same-origin
+		// keeps the Referer only between the gateway and the browser, which is
+		// what lets an escaped click be resolved).
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Referrer-Policy", "same-origin")
+		switch r.URL.Path {
+		case homePath:
+			handleHome(w, r)
+		case pageRoute:
+			handlePage(w, r)
+		case assetRoute:
+			handleAsset(w, r)
+		case "/favicon.ico":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			// A path we did not write: almost always a root-relative URL built
+			// by the site's JavaScript. Resolve it against the page the
+			// browser came from instead of letting the router answer 404/400.
+			handleEscaped(w, r)
+		}
 	})
+	mux.Handle("/", h)
 
 	srv := &http.Server{
 		Addr: *addr,
@@ -166,6 +194,105 @@ func getSession(w http.ResponseWriter, r *http.Request) *session {
 	return s
 }
 
+// setSessionBase remembers the last page for this session, in RAM only.
+func setSessionBase(s *session, u *url.URL) {
+	if s == nil || u == nil {
+		return
+	}
+	sessMu.Lock()
+	s.base = u
+	sessMu.Unlock()
+}
+
+// upstreamFromViewerURL turns a gateway URL (…/go?u=<b64> or …/cgi-bin/webview/go?u=…)
+// back into the site URL it proxied.
+func upstreamFromViewerURL(g *url.URL) *url.URL {
+	if g == nil {
+		return nil
+	}
+	raw := g.Query().Get(targetParam)
+	if raw == "" {
+		raw = g.Query().Get("u")
+	}
+	if raw == "" {
+		return nil
+	}
+	s, err := dec(raw)
+	if err != nil {
+		return nil
+	}
+	u, err := url.Parse(s)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil
+	}
+	return u
+}
+
+// sourcePage is the site page a click started from. It prefers the browser's
+// Referer (decode the gateway URL inside it), then the session's last page.
+func sourcePage(r *http.Request) *url.URL {
+	if ref := r.Header.Get("Referer"); ref != "" {
+		if g, err := url.Parse(ref); err == nil {
+			if u := upstreamFromViewerURL(g); u != nil {
+				return u
+			}
+		}
+	}
+	if c, err := r.Cookie("wv_sid"); err == nil {
+		sessMu.Lock()
+		s := sessions[c.Value]
+		var u *url.URL
+		if s != nil {
+			u = s.base
+		}
+		sessMu.Unlock()
+		return u
+	}
+	return nil
+}
+
+func embedRequest(r *http.Request) bool {
+	if r.URL.Query().Get("e") == "1" {
+		return true
+	}
+	if ref := r.Header.Get("Referer"); ref != "" {
+		if g, err := url.Parse(ref); err == nil {
+			return g.Query().Get("e") == "1"
+		}
+	}
+	return false
+}
+
+// handleEscaped takes a request the rewriter did not produce — typically a
+// root-relative URL built by the site's JavaScript — and sends it to the same
+// site instead of letting the router's web server answer 404/400.
+func handleEscaped(w http.ResponseWriter, r *http.Request) {
+	base := sourcePage(r)
+	if base == nil {
+		http.NotFound(w, r)
+		return
+	}
+	target := &url.URL{
+		Scheme:   base.Scheme,
+		Host:     base.Host,
+		Path:     r.URL.Path,
+		RawQuery: r.URL.RawQuery,
+	}
+	q := url.Values{targetParam: {enc(target.String())}}
+	if embedRequest(r) {
+		q.Set("e", "1")
+	}
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		http.Redirect(w, r, pageRoute+"?"+q.Encode(), http.StatusFound)
+		return
+	}
+	// A form or fetch POST cannot be redirected without losing its body, so
+	// proxy it in place through the normal page handler.
+	r2 := r.Clone(r.Context())
+	r2.URL = &url.URL{Path: pageRoute, RawQuery: q.Encode()}
+	handlePage(w, r2)
+}
+
 func enc(u string) string { return base64.RawURLEncoding.EncodeToString([]byte(u)) }
 
 func dec(s string) (string, error) {
@@ -197,12 +324,14 @@ func normalizeTarget(raw string) (string, error) {
 	return u.String(), nil
 }
 
-// targetFromRequest accepts /go?u=<base64> (links we wrote) or /go?url=<plain>
-// (the URL bar).
+// targetFromRequest accepts /go?wv_u=<base64> (links we wrote), the older
+// /go?u=<base64>, or /go?url=<plain> (the URL bar).
 func targetFromRequest(r *http.Request) (string, error) {
-	if b := r.URL.Query().Get("u"); b != "" {
-		if s, err := dec(b); err == nil {
-			return normalizeTarget(s)
+	for _, k := range []string{targetParam, "u"} {
+		if b := r.URL.Query().Get(k); b != "" {
+			if s, err := dec(b); err == nil {
+				return normalizeTarget(s)
+			}
 		}
 	}
 	return normalizeTarget(r.URL.Query().Get("url"))
@@ -241,7 +370,7 @@ func rewriteRef(base *url.URL, raw, kind string, embed bool) string {
 	}
 	frag := abs.Fragment
 	abs.Fragment = ""
-	u := route + "?u=" + enc(abs.String())
+	u := route + "?" + targetParam + "=" + enc(abs.String())
 	if embed && kind != "asset" {
 		u += "&e=1"
 	}
@@ -320,6 +449,39 @@ func findBody(n *html.Node) *html.Node {
 	return nil
 }
 
+func setAttr(n *html.Node, key, val string) {
+	for i := range n.Attr {
+		if strings.EqualFold(n.Attr[i].Key, key) {
+			n.Attr[i].Val = val
+			return
+		}
+	}
+	n.Attr = append(n.Attr, html.Attribute{Key: key, Val: val})
+}
+
+func hiddenInput(name, value string) *html.Node {
+	return &html.Node{Type: html.ElementNode, Data: "input", Attr: []html.Attribute{
+		{Key: "type", Val: "hidden"},
+		{Key: "name", Val: name},
+		{Key: "value", Val: value},
+	}}
+}
+
+func dropInputNamed(n *html.Node, name string) {
+	for c := n.FirstChild; c != nil; {
+		next := c.NextSibling
+		if c.Type == html.ElementNode && strings.EqualFold(c.Data, "input") {
+			for _, a := range c.Attr {
+				if strings.EqualFold(a.Key, "name") && a.Val == name {
+					n.RemoveChild(c)
+					break
+				}
+			}
+		}
+		c = next
+	}
+}
+
 func rewriteHTML(body []byte, base *url.URL, notice string, embed bool) ([]byte, error) {
 	doc, err := html.Parse(bytes.NewReader(body))
 	if err != nil {
@@ -333,7 +495,8 @@ func rewriteHTML(body []byte, base *url.URL, notice string, embed bool) ([]byte,
 				n.Parent.RemoveChild(n)
 				return
 			case "meta":
-				// Drop CSP and refresh tags that would bypass the gateway.
+				// Drop CSP and refresh tags that would bypass the gateway, and
+				// a site referrer policy that would fight the gateway's own.
 				var drop bool
 				for _, a := range n.Attr {
 					k := strings.ToLower(a.Key)
@@ -342,6 +505,9 @@ func rewriteHTML(body []byte, base *url.URL, notice string, embed bool) ([]byte,
 						if v == "content-security-policy" || v == "refresh" {
 							drop = true
 						}
+					}
+					if k == "name" && strings.EqualFold(a.Val, "referrer") {
+						drop = true
 					}
 				}
 				if drop {
@@ -357,8 +523,6 @@ func rewriteHTML(body []byte, base *url.URL, notice string, embed bool) ([]byte,
 					a.Val = rewriteRef(base, a.Val, refKind(n.Data, k), embed)
 				case "srcset", "data-srcset":
 					a.Val = rewriteSrcset(a.Val, base, embed)
-				case "action":
-					a.Val = rewriteRef(base, a.Val, "nav", embed)
 				case "integrity", "nonce":
 					a.Val = ""
 				case "style":
@@ -369,46 +533,43 @@ func rewriteHTML(body []byte, base *url.URL, notice string, embed bool) ([]byte,
 				n.FirstChild.Data = rewriteCSS(n.FirstChild.Data, base)
 			}
 			if strings.EqualFold(n.Data, "form") {
-				// Resolve the original action (missing means "this page") and
-				// carry it as a hidden field, so GET forms keep their target
-				// when the browser replaces the query string.
+				// The action is handled only here: resolving it twice would
+				// wrap the gateway URL instead of the site's own target.
+				method := "get"
 				orig := ""
-				for i := range n.Attr {
-					if strings.EqualFold(n.Attr[i].Key, "action") {
-						orig = n.Attr[i].Val
+				for _, a := range n.Attr {
+					switch strings.ToLower(a.Key) {
+					case "method":
+						method = strings.ToLower(strings.TrimSpace(a.Val))
+					case "action":
+						orig = a.Val
 					}
 				}
 				ref, err := url.Parse(strings.TrimSpace(orig))
-				if err != nil || strings.TrimSpace(orig) == "" {
+				if err != nil {
 					ref = &url.URL{}
 				}
 				full := base.ResolveReference(ref)
-				for i := range n.Attr {
-					if strings.EqualFold(n.Attr[i].Key, "action") {
-						n.Attr[i].Val = pageRoute
-					}
-				}
-				// Drop a stale u field, then add ours.
-				for c := n.FirstChild; c != nil; c = c.NextSibling {
-					if c.Type == html.ElementNode && strings.EqualFold(c.Data, "input") {
-						for _, a := range c.Attr {
-							if strings.EqualFold(a.Key, "name") && a.Val == "u" {
-								n.RemoveChild(c)
-								break
-							}
+				if (full.Scheme == "http" || full.Scheme == "https") && full.Host != "" {
+					full.Fragment = ""
+					if method == "get" || method == "" {
+						// GET replaces the query string, so the target travels
+						// in a hidden field.
+						setAttr(n, "action", pageRoute)
+						dropInputNamed(n, targetParam)
+						n.AppendChild(hiddenInput(targetParam, enc(full.String())))
+						if embed {
+							n.AppendChild(hiddenInput("e", "1"))
 						}
+					} else {
+						// POST keeps the body byte for byte; the target rides
+						// in the action's query string.
+						action := pageRoute + "?" + targetParam + "=" + enc(full.String())
+						if embed {
+							action += "&e=1"
+						}
+						setAttr(n, "action", action)
 					}
-				}
-				hidden := &html.Node{Type: html.ElementNode, Data: "input", Attr: []html.Attribute{
-					{Key: "type", Val: "hidden"},
-					{Key: "name", Val: "u"},
-					{Key: "value", Val: enc(full.String())},
-				}}
-				n.AppendChild(hidden)
-				if embed {
-					n.AppendChild(&html.Node{Type: html.ElementNode, Data: "input", Attr: []html.Attribute{
-						{Key: "type", Val: "hidden"}, {Key: "name", Val: "e"}, {Key: "value", Val: "1"},
-					}})
 				}
 			}
 			if strings.EqualFold(n.Data, "body") && notice != "" {
@@ -464,7 +625,7 @@ func barHTML(current string) string {
 <a href="/" title="Web Viewer home">&#8962;</a>
 <button type="button" onclick="history.back()" title="Back">&#8592;</button>
 <form action="/go" method="get" style="display:flex;flex:1;gap:6px;margin:0">
-<input name="url" value="` + cur + `" inputmode="url" autocapitalize="off" spellcheck="false" aria-label="Address">
+<input name="url" value="` + cur + `" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Address">
 <button type="submit">Go</button>
 </form>
 </div>
@@ -511,13 +672,52 @@ func copyHeader(dst, src http.Header) {
 		switch http.CanonicalHeaderKey(k) {
 		case "Content-Security-Policy", "X-Frame-Options", "Strict-Transport-Security",
 			"Content-Encoding", "Content-Length", "Transfer-Encoding", "Set-Cookie",
-			"Clear-Site-Data":
+			"Clear-Site-Data", "Cache-Control", "Referrer-Policy":
+			// Cache-Control/Referrer-Policy are set once by the gateway:
+			// nothing is cached and the upstream URL never leaks.
 			continue
 		}
 		for _, v := range vv {
 			dst.Add(k, v)
 		}
 	}
+}
+
+// rewriteRefresh keeps a site's Refresh header inside the gateway: a relative
+// URL in it would otherwise make the browser navigate to the router itself.
+func rewriteRefresh(h http.Header, base *url.URL) {
+	raw := h.Get("Refresh")
+	if raw == "" || base == nil {
+		return
+	}
+	delay, dest := "0", ""
+	i := strings.IndexByte(raw, ';')
+	if i < 0 {
+		delay = strings.TrimSpace(raw)
+	} else {
+		delay = strings.TrimSpace(raw[:i])
+		rest := strings.TrimSpace(raw[i+1:])
+		if j := strings.IndexByte(rest, '='); j >= 0 {
+			dest = strings.TrimSpace(rest[j+1:])
+		}
+	}
+	dest = strings.Trim(dest, `"'`)
+	if dest == "" {
+		// A bare "Refresh: 30" just reloads the page; harmless and stays local.
+		h.Set("Refresh", delay)
+		return
+	}
+	ref, err := url.Parse(dest)
+	if err != nil {
+		h.Del("Refresh")
+		return
+	}
+	abs := base.ResolveReference(ref)
+	if abs.Scheme != "http" && abs.Scheme != "https" {
+		h.Del("Refresh")
+		return
+	}
+	h.Set("Refresh", delay+"; url="+pageRoute+"?"+targetParam+"="+enc(abs.String()))
 }
 
 func doFetch(s *session, r *http.Request, target string, doc bool) (*http.Response, *url.URL, error) {
@@ -539,6 +739,20 @@ func doFetch(s *session, r *http.Request, target string, doc bool) (*http.Respon
 		req.Header.Set("Sec-Fetch-Site", "none")
 		req.Header.Set("Sec-Fetch-User", "?1")
 		req.Header.Set("Upgrade-Insecure-Requests", "1")
+		// A click inside the viewer is an in-site navigation on the real web.
+		// Send the originating page as Referer so bot protection (eBay/Akamai
+		// answers 400/403 to bare listing requests) sees the same headers a
+		// browser would send.
+		if src := sourcePage(r); src != nil {
+			ref := src.Scheme + "://" + src.Host + "/"
+			site := "cross-site"
+			if tu, err := url.Parse(target); err == nil && strings.EqualFold(tu.Host, src.Host) {
+				ref = src.String()
+				site = "same-origin"
+			}
+			req.Header.Set("Referer", ref)
+			req.Header.Set("Sec-Fetch-Site", site)
+		}
 	} else {
 		req.Header.Set("Sec-Fetch-Dest", "image")
 		req.Header.Set("Sec-Fetch-Mode", "no-cors")
@@ -612,7 +826,7 @@ func handlePage(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		extra := url.Values{}
 		for k, vs := range q {
-			if k == "u" || k == "url" {
+			if k == "u" || k == "url" || k == "e" || k == targetParam {
 				continue
 			}
 			for _, v := range vs {
@@ -639,9 +853,11 @@ func handlePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	setSessionBase(s, finalURL)
 
 	ct := resp.Header.Get("Content-Type")
 	base, _ := url.Parse(finalURL.String())
+	rewriteRefresh(resp.Header, base)
 
 	switch {
 	case strings.HasPrefix(ct, "text/html"), strings.HasPrefix(ct, "application/xhtml"):
@@ -674,7 +890,10 @@ func handlePage(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAsset(w http.ResponseWriter, r *http.Request) {
-	b := r.URL.Query().Get("u")
+	b := r.URL.Query().Get(targetParam)
+	if b == "" {
+		b = r.URL.Query().Get("u") // links written by older builds
+	}
 	target, err := dec(b)
 	if err != nil {
 		http.Error(w, "bad asset reference", http.StatusBadRequest)

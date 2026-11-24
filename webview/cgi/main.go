@@ -83,6 +83,11 @@ func handle(w http.ResponseWriter, r *http.Request) {
 				w.Header().Add(ck, location(v))
 			}
 			continue
+		case "Refresh":
+			for _, v := range vv {
+				w.Header().Add(ck, refreshLocation(v))
+			}
+			continue
 		}
 		for _, v := range vv {
 			w.Header().Add(ck, v)
@@ -141,16 +146,29 @@ func location(v string) string {
 	return v
 }
 
+// refreshLocation prefixes the URL part of a Refresh header (the viewer
+// rewrites it to "/go?wv_u=…" when a site redirects client-side).
+func refreshLocation(v string) string {
+	i := strings.Index(strings.ToLower(v), "url=")
+	if i < 0 {
+		return v
+	}
+	return v[:i+4] + location(strings.TrimSpace(v[i+4:]))
+}
+
 var rootRefs = strings.NewReplacer(
 	`href="/"`, `href="`+prefix+`/"`,
 
-	`"/go`, `"`+prefix+`/go`,
-	`'/go`, `'`+prefix+`/go`,
-	`(/go`, `(`+prefix+`/go`,
+	// The viewer's own routes always carry a query string; match only that so
+	// inline-script strings like "/google..." are not rewritten by accident.
+	`action="/go"`, `action="`+prefix+`/go"`,
+	`"/go?`, `"`+prefix+`/go?`,
+	`'/go?`, `'`+prefix+`/go?`,
+	`(/go?`, `(`+prefix+`/go?`,
 
-	`"/raw`, `"`+prefix+`/raw`,
-	`'/raw`, `'`+prefix+`/raw`,
-	`(/raw`, `(`+prefix+`/raw`,
+	`"/raw?`, `"`+prefix+`/raw?`,
+	`'/raw?`, `'`+prefix+`/raw?`,
+	`(/raw?`, `(`+prefix+`/raw?`,
 	// srcset entries after the first are joined with ", ".
-	`, /raw`, `, `+prefix+`/raw`,
+	`, /raw?`, `, `+prefix+`/raw?`,
 )

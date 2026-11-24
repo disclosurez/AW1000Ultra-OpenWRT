@@ -28,11 +28,27 @@ func TestRewrite(t *testing.T) {
 		{`<style>x{background:url(/raw?u=c)}</style>`, `<style>x{background:url(/cgi-bin/webview/raw?u=c)}</style>`},
 		{`@import "/raw?u=d";`, `@import "/cgi-bin/webview/raw?u=d";`},
 		{`<a href="https://upstream.example/x">`, `<a href="https://upstream.example/x">`},
+		{`<script>var u="/google/collect"</script>`, `<script>var u="/google/collect"</script>`},
 		{`<a href="//cdn.example/x">`, `<a href="//cdn.example/x">`},
 	}
 	for _, c := range cases {
 		if got := string(rewrite([]byte(c.in))); got != c.want {
 			t.Errorf("rewrite(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestRefreshLocation(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"0; url=/go?wv_u=x", "0; url=/cgi-bin/webview/go?wv_u=x"},
+		{"5; URL=/go?wv_u=x", "5; URL=/cgi-bin/webview/go?wv_u=x"},
+		{"0; url=/cgi-bin/webview/go?wv_u=x", "0; url=/cgi-bin/webview/go?wv_u=x"},
+		{"30", "30"},
+		{"0; url=https://example.com/", "0; url=https://example.com/"},
+	}
+	for _, c := range cases {
+		if got := refreshLocation(c.in); got != c.want {
+			t.Errorf("refreshLocation(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }

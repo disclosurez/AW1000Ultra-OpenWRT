@@ -818,8 +818,27 @@ How it works:
   so logins/carts work without exposing upstream cookies to the client.
 - Redirects are followed server-side; POST bodies are forwarded unchanged.
 - GET forms keep their target: the form action is replaced by `/go` plus a
-  hidden `u` field, and the remaining query fields are appended to the target
-  URL (search boxes work). Anchors (`#section`) survive the hop.
+  hidden `wv_u` field, and the remaining query fields are appended to the target
+  URL (search boxes work). POST forms carry the target in the action's query
+  (`/go?wv_u=…`) so the body is forwarded byte for byte. The field is named
+  `wv_u` so it cannot collide with a site's own `u` field. Anchors (`#section`)
+  survive the hop.
+- **Escaped navigations are caught.** Client-side JavaScript can build
+  root-relative URLs (`location.href='/search/x?y'`) that no rewriter can see.
+  Instead of letting the router's web server answer 404/400, the viewer resolves
+  such a path against the page the browser came from (its `Referer`, decoded
+  from `/go?u=…`, or the session's last page, RAM only) and proxies it to that
+  site. Over HTTPS, `ocgate` routes a path whose `Referer` is a
+  `/cgi-bin/webview/` page back through the CGI bridge for the same treatment.
+  A `Refresh:` response header is rewritten the same way.
+- **No browsing record.** The viewer keeps no history: URLs are never logged or
+  written to disk, sessions (cookie jar + last page) live only in RAM and expire
+  after 30 idle minutes, and every response sends `Cache-Control: no-store` and
+  `Referrer-Policy: same-origin` so nothing is cached and the gateway URL is
+  never sent to a third party (same-origin only — that is also what lets an
+  escaped click be traced back to its page). Site `<meta name=referrer>` tags
+  are dropped so a page cannot override it. The upstream `Referer` is the
+  originating page (origin only cross-site), as a real browser would send.
 - Every proxied page carries a fixed address bar (home, back, URL field, Go)
   injected after the rewrite pass, so it is never itself rewritten. Frames get
   `&e=1` and are served without the bar to avoid nesting it.
@@ -1173,6 +1192,22 @@ probe-*.sh, test-*.sh                                                     ad-hoc
 ```
 
 ## Changelog
+
+- **2026-11-24** — **Web viewer: escaped clicks fixed, no browsing record.**
+  Clicking a link or a search result inside the viewer could land on the router
+  itself (`404 Not Found` / `400 Bad Request`) because client-side JavaScript
+  builds root-relative URLs the rewriter cannot see. The viewer now resolves
+  such a path against the page the click came from (`Referer`/last page) and
+  proxies it to that site; over HTTPS `ocgate` routes those paths back through
+  the CGI bridge. Form targets were also wrong: the form action was rewritten
+  twice, so a search/submit fetched `https://site/go?u=…` instead of the site's
+  own URL, and POST forms lost their target completely — both fixed (GET uses a
+  hidden field, POST puts `wv_u` in the action query, body untouched). `Refresh:`
+  headers are rewritten, click-throughs send the real `Referer`/`Sec-Fetch-Site`
+  upstream, and privacy is enforced: no URL logging or history, RAM-only
+  sessions, `Cache-Control: no-store` and `Referrer-Policy: same-origin` on
+  every response. `wvcgi`'s link prefixing is limited to `/go?` and `/raw?` so
+  inline scripts are not mangled.
 
 - **2026-11-24** — **Demo parity pass.** The static demo now has 56 views.
   Service Logs gained the missing **DHCP / DNS** and **SSH / Web** groups.

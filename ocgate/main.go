@@ -76,7 +76,8 @@ func reverseProxy(target, strip string) http.Handler {
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("upstream %s %s: %v", r.Method, r.URL.Path, err)
+			// No request path here: the viewer's browsing must not be recorded.
+			log.Printf("upstream %s failed: %v", r.Method, err)
 			http.Error(w, "gate: "+err.Error(), http.StatusBadGateway)
 		},
 		FlushInterval: -1,
@@ -87,6 +88,14 @@ func reverseProxy(target, strip string) http.Handler {
 // appPaths are the SPA's own root-relative paths; none of them collide with
 // LuCI (/cgi-bin, /luci-static).
 var appPaths = []string{"/api/", "/assets/", "/_assets/", "/session", "/server", "/settings", "/help", "/new", "/project", "/sw.js", "/manifest.webmanifest"}
+
+// viewerReferer reports whether the request came from a web-viewer page
+// (direct :8090 frames use the bridge only over HTTPS, but the viewer's own
+// links always carry /cgi-bin/webview in their Referer).
+func viewerReferer(r *http.Request) bool {
+	ref := r.Header.Get("Referer")
+	return strings.Contains(ref, "/cgi-bin/webview/") || strings.HasSuffix(ref, "/cgi-bin/webview")
+}
 
 func isAppPath(p string) bool {
 	for _, pre := range appPaths {
@@ -112,6 +121,19 @@ func (g *gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 		g.app.ServeHTTP(w, r)
+		return
+	}
+
+	// A root-relative navigation out of a web-viewer page belongs to the
+	// proxied site, not to LuCI. The viewer rewrites its links, but URLs built
+	// by client-side JavaScript cannot be rewritten; route those back through
+	// the bridge so the viewer can resolve them instead of uhttpd answering
+	// 404/400.
+	if viewerReferer(r) && !strings.HasPrefix(p, "/cgi-bin/") {
+		r2 := r.Clone(r.Context())
+		r2.URL.Path = "/cgi-bin/webview" + p
+		r2.URL.RawPath = ""
+		g.luci.ServeHTTP(w, r2)
 		return
 	}
 
