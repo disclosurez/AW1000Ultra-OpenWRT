@@ -190,6 +190,43 @@ ifstatus wan | grep '"up"'                     # false — SIM torn down
 `./test-wanfailover2.sh` runs that drill end to end and prints the SIM state at
 each step.
 
+### 1d. Uplink switch notifications (Telegram)
+
+The watchdog pings the phone when it actually switches, so a silent ISP outage
+does not go unnoticed.
+
+| File | Role |
+|---|---|
+| `/usr/sbin/wan-notify` | `sim\|isp <reason>` · `heartbeat` · `test` · `chatid` · `status` |
+| `/etc/wan-notify.conf` | `TG_TOKEN`, `TG_CHAT` (comma-separated ok), `MUTE` — mode **600** |
+| `/usr/sbin/wan-failover` | `notify()` after each state transition (detached; never blocks the probe loop) |
+| cron | `0 9 * * * wan-notify heartbeat` — dead-man's switch: no message = no router |
+| log | `logger -t wan-notify`, `/tmp/wan-notify.log` (capped 64 KB) |
+
+- Sends only on a real transition (the loop already debounces with
+  `FAIL_TRIES`/`OK_TRIES`), never on boot.
+- The message goes out over whichever uplink just came up, so a switch *to* the
+  SIM is reported over the SIM.
+- `MUTE` (default 300 s) keeps a flapping ISP from pinging every cycle; held-back
+  switches are counted and appended to the next message (`+3 suppressed`).
+- Delivery retries 3× at 5 s, `-4` + 10 s timeout, because DNS can be stale for a
+  second or two right after the route changes.
+- The token is **never** in `argv`: `curl` runs from a 0600 `--config` file that
+  is deleted immediately.
+- Empty token/chat = silent no-op (logged once), so the watchdog is safe before
+  setup.
+
+```bash
+/usr/sbin/wan-notify status
+/usr/sbin/wan-notify chatid     # ids that have written to the bot
+/usr/sbin/wan-notify test
+/usr/sbin/wan-notify heartbeat
+tail -5 /tmp/wan-notify.log
+```
+
+Getting the token: Telegram → **@BotFather** → `/newbot` → name + username
+ending in `bot` → paste the token into `TG_TOKEN`; open the bot, press START,
+send anything, then run `wan-notify chatid` and put that in `TG_CHAT`.
 
 ### 2. Parental control
 
@@ -1192,6 +1229,17 @@ probe-*.sh, test-*.sh                                                     ad-hoc
 ```
 
 ## Changelog
+
+- **2026-11-24** — **Uplink switch notifications.** `wan-failover` now tells
+  the phone when it actually switches uplink (ISP ↔ SIM) instead of only
+  logging it. Delivery is a Telegram bot message: `/usr/sbin/wan-notify`
+  (`sim|isp`, `heartbeat`, `test`, `chatid`, `status`), config in
+  `/etc/wan-notify.conf` (0600), token passed to curl through a temporary
+  `--config` so it never reaches `argv`. The call is detached and retries 3×,
+  so a slow API can never stall the probe loop; a 5-minute cooldown stops a
+  flapping ISP from pinging every cycle and counts what it held back. The
+  `init` path is silent, so a reboot does not notify. A daily `heartbeat`
+  cron line acts as a dead-man's switch: no message = no router. See §1d.
 
 - **2026-11-24** — **Web viewer: escaped clicks fixed, no browsing record.**
   Clicking a link or a search result inside the viewer could land on the router

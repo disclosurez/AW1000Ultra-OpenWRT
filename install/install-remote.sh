@@ -57,6 +57,7 @@ put "$SRC/system/sbin/lan-scan"            /usr/sbin/lan-scan            0755
 put "$SRC/system/sbin/port-scan"           /usr/sbin/port-scan           0755
 put "$SRC/system/sbin/port-scan-all"       /usr/sbin/port-scan-all       0755
 put "$SRC/system/sbin/wan-failover"        /usr/sbin/wan-failover        0755
+put "$SRC/system/sbin/wan-notify"           /usr/sbin/wan-notify          0755
 put "$SRC/system/sbin/vpnplit-route"       /usr/sbin/vpnplit-route       0755
 put "$SRC/system/sbin/vpnsplit-warm"        /usr/sbin/vpnsplit-warm        0755
 put "$SRC/system/sbin/captiveportal-ctl"   /usr/sbin/captiveportal       0755
@@ -281,6 +282,9 @@ if [ "${WITH_WANFAILOVER:-1}" = 1 ]; then
 	log "uplink failover"
 	put "$SRC/system/init.d/wanfailover" /etc/init.d/wanfailover 0755
 	seed wanfailover "$SRC/uci/wanfailover"
+	# Secret file: never overwritten once it exists (it holds the bot token).
+	[ -f /etc/wan-notify.conf ] || put "$SRC/system/wan-notify.conf" /etc/wan-notify.conf 0600
+	cron_add '0 9 * * * /usr/sbin/wan-notify heartbeat >/dev/null 2>&1'
 	/etc/init.d/wanfailover enable
 	/etc/init.d/wanfailover restart 2>/dev/null || \
 		log "warning: failover started but no isp uplink yet (see docs/INSTALL.md §4)"

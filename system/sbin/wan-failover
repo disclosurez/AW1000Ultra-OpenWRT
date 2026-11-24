@@ -251,6 +251,13 @@ isp_policy_del() {
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# Tell the phone a switch really happened. Detached so a slow or unreachable
+# Telegram API can never stall the probe loop (and never leaves a zombie).
+notify() { # notify <state> <reason>
+	[ -x /usr/sbin/wan-notify ] || return 0
+	( /usr/sbin/wan-notify "$1" "$2" >/dev/null 2>&1 & )
+}
+
 write_status() {
 	{
 		echo "state=$STATE"
@@ -361,7 +368,10 @@ run_loop() {
 			;;
 		isp)
 			if [ "$WAN_ONLINE" = down ] && [ "$fails" -ge "$FAIL_TRIES" ]; then
-				prefer_sim "ISP down ${fails}x" && { STATE=sim; SINCE=$(now); }
+				prefer_sim "ISP down ${fails}x" && {
+					STATE=sim; SINCE=$(now)
+					notify sim "ISP down ${fails}x"
+				}
 			else
 				# ISP healthy: keep our metric on top and the SIM parked
 				set_route "$WAN_DEV" "$(dev_gw_any "$WAN_DEV" "$WAN_IFACE")" "$ISP_UP"
@@ -370,7 +380,10 @@ run_loop() {
 			;;
 		sim)
 			if [ "$WAN_ONLINE" = up ] && [ "$oks" -ge "$OK_TRIES" ]; then
-				prefer_isp "ISP recovered ${oks}x" && { STATE=isp; SINCE=$(now); }
+				prefer_isp "ISP recovered ${oks}x" && {
+					STATE=isp; SINCE=$(now)
+					notify isp "ISP recovered ${oks}x"
+				}
 			else
 				set_route "$MODEM_DEV" "$(dev_gw "$MODEM_DEV")" "$SIM_UP"
 				set_route "$WAN_DEV" "$(dev_gw_any "$WAN_DEV" "$WAN_IFACE")" "$ISP_DOWN"

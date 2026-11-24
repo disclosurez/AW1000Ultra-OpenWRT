@@ -14,3 +14,7 @@
 */30 * * * * /usr/sbin/port-scan-all >/dev/null 2>&1
 0 4 1 * * /usr/sbin/oui-update >/dev/null 2>&1
 0 5 * * 0 /usr/sbin/dnscat-update >/dev/null 2>&1
+
+# Uplink switch notices (Telegram). The daily line is a dead-man's switch:
+# if it stops arriving, the router is offline or wedged.
+0 9 * * * /usr/sbin/wan-notify heartbeat >/dev/null 2>&1

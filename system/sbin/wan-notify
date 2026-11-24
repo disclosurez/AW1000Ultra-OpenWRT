@@ -1,0 +1,186 @@
+#!/bin/sh
+# wan-notify — ping the phone when the uplink switches (Telegram bot).
+#
+#   wan-notify sim|isp <reason>   send a switch notice (called by wan-failover)
+#   wan-notify heartbeat          daily "still alive" message (missing = alarm)
+#   wan-notify test               send a test message, print the API reply
+#   wan-notify chatid             print chat ids that have written to the bot
+#   wan-notify status             show config + cooldown state
+#
+# Config: /etc/wan-notify.conf (0600).  The bot token is never passed in argv:
+# curl is driven from a 0600 --config file that is deleted immediately.
+
+CONF=/etc/wan-notify.conf
+TAG=wan-notify
+STATUS=/tmp/wanfailover.status
+STATE_FILE=/tmp/wan-notify.last
+LOG=/tmp/wan-notify.log
+
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+TG_TOKEN=${TG_TOKEN:-}
+TG_CHAT=${TG_CHAT:-}
+MUTE=${MUTE:-300}
+
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+log() {
+	logger -t "$TAG" "$*"
+	echo "$(now) $*" >> "$LOG"
+	if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 65536 ]; then
+		tail -c 32768 "$LOG" > "$LOG.t" && mv "$LOG.t" "$LOG"
+	fi
+}
+
+sval() { sed -n "s/^$1=//p" "$STATUS" 2>/dev/null; }
+
+cfgfile() { # cfgfile <url> [data ...]  -> path (0600, caller removes)
+	local f
+	f=$(mktemp /tmp/wan-notify.XXXXXX) || return 1
+	chmod 600 "$f"
+	printf 'url = "%s"\n' "$1" > "$f"
+	shift
+	while [ $# -gt 0 ]; do
+		printf 'data = "%s"\n' "$1" >> "$f"
+		shift
+	done
+	echo "$f"
+}
+
+tg_one() { # tg_one <chat_id> <encoded text> -> 0 on HTTP 200
+	local f code resp rc
+	resp=/tmp/wan-notify.reply
+	f=$(cfgfile "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+		"chat_id=$1" "text=$2") || return 1
+	code=$(curl -4 -s -m 10 -o "$resp" -w '%{http_code}' --config "$f" 2>/dev/null)
+	rc=$?
+	rm -f "$f"
+	[ "$rc" = 0 ] || { log "curl failed (rc=$rc)"; return 1; }
+	[ "$code" = 200 ] && return 0
+	log "telegram HTTP $code: $(head -c 200 "$resp" 2>/dev/null)"
+	return 1
+}
+
+tg() { # tg <text> -> 0 if every configured chat got it
+	local text ids id rc=0
+	# a newline inside a curl --config value breaks the parser: send %0A
+	text=$(printf '%s\n' "$1" | awk 'BEGIN{ORS=""} NR>1{printf "%%0A"} {print}' \
+		| sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+	ids=$(echo "$TG_CHAT" | tr ',' ' ')
+	for id in $ids; do
+		tg_one "$id" "$text" || rc=1
+	done
+	return $rc
+}
+
+send_retry() { # send_retry <text>
+	local i=1
+	while [ "$i" -le 3 ]; do
+		tg "$1" && { log "sent"; return 0; }
+		[ "$i" -lt 3 ] && sleep 5
+		i=$((i + 1))
+	done
+	log "giving up after 3 attempts"
+	return 1
+}
+
+compose() { # compose <state> <reason>
+	local st=$1 why=$2 head wip mip
+	case "$st" in
+	sim) head='📶 Uplink → SIM (mobile data)' ;;
+	isp) head='🔌 Uplink → ISP (wired)' ;;
+	*)   head="Uplink → $st" ;;
+	esac
+	wip=$(sval wan_ip); mip=$(sval modem_ip)
+	[ -n "$wip" ] || wip=-
+	[ -n "$mip" ] || mip=-
+	printf '%s\nreason: %s\nSIM: %s · ISP: %s\n%s' \
+		"$head" "${why:-manual}" "$mip" "$wip" "$(now)"
+}
+
+compose_hb() {
+	local st since
+	st=$(sval state); since=$(sval since)
+	[ -n "$st" ] || st=unknown
+	[ -n "$since" ] || since=-
+	printf '✅ Router alive · uplink %s\nsince %s · %s' \
+		"$(echo "$st" | tr 'a-z' 'A-Z')" "$since" "$(now)"
+}
+
+# A flapping ISP can switch every 30 s; keep at most one message per MUTE
+# seconds and report how many were held back.
+may_send() { # may_send <state> -> 0 send, 1 suppressed
+	local last_ts="-" last_st="" supp=0 t n
+	[ "$MUTE" -gt 0 ] || return 0
+	[ -r "$STATE_FILE" ] && read -r last_ts last_st supp < "$STATE_FILE"
+	if [ "$last_ts" != "-" ] && [ -n "$last_ts" ]; then
+		t=$(( $(date +%s) - last_ts ))
+		if [ "$t" -lt "$MUTE" ]; then
+			n=$(( ${supp:-0} + 1 ))
+			echo "$(date +%s) $1 $n" > "$STATE_FILE"
+			log "suppressed ($1, ${t}s into ${MUTE}s cooldown)"
+			return 1
+		fi
+	fi
+	echo "$(date +%s) $1 0" > "$STATE_FILE"
+	SUPP=${supp:-0}
+	return 0
+}
+
+if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+	case "$1" in
+	test|chatid|status) ;;
+	*) log "no Telegram token/chat in $CONF — not sending"; exit 0 ;;
+	esac
+fi
+
+case "$1" in
+sim|isp)
+	# wan-failover calls this the instant the route changes; give it a moment
+	# to write the fresh status file, then report.
+	sleep 2
+	may_send "$1" || exit 0
+	msg=$(compose "$1" "${2:-manual}")
+	[ "${SUPP:-0}" -gt 0 ] && msg="$msg (+$SUPP suppressed)"
+	send_retry "$msg"
+	;;
+heartbeat)
+	[ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || exit 0
+	send_retry "$(compose_hb)"
+	;;
+test)
+	[ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || {
+		echo "set TG_TOKEN and TG_CHAT in $CONF first" >&2; exit 1; }
+	f=$(cfgfile "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+		"chat_id=$(echo "$TG_CHAT" | cut -d, -f1)" "text=wan-notify test")
+	curl -4 -sS -m 10 --config "$f"; echo
+	rm -f "$f"
+	;;
+chatid)
+	[ -n "$TG_TOKEN" ] || { echo "set TG_TOKEN in $CONF first" >&2; exit 1; }
+	f=$(cfgfile "https://api.telegram.org/bot${TG_TOKEN}/getUpdates")
+	out=$(curl -4 -sS -m 10 --config "$f")
+	rm -f "$f"
+	ids=$(echo "$out" | grep -o '"chat":{"id":-\{0,1\}[0-9]\{1,\}' | sed 's/.*"id"://' | sort -u)
+	if [ -n "$ids" ]; then
+		echo "$ids"
+	else
+		echo "no chats yet — open the bot in Telegram, press START, send /start" >&2
+		echo "$out" >&2
+		exit 1
+	fi
+	;;
+status)
+	echo "config:   $CONF"
+	echo "token:    $([ -n "$TG_TOKEN" ] && echo present || echo MISSING)"
+	echo "chat:     ${TG_CHAT:-MISSING}"
+	echo "cooldown: ${MUTE}s"
+	[ -r "$STATE_FILE" ] && { printf 'last:     '; cat "$STATE_FILE"; }
+	echo "uplink:   $(sval state) since $(sval since)"
+	[ -s "$LOG" ] && { echo "--- recent ---"; tail -5 "$LOG"; }
+	;;
+*)
+	echo "usage: $0 sim|isp <reason> | heartbeat | test | chatid | status" >&2
+	exit 1
+	;;
+esac
