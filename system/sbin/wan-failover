@@ -253,9 +253,9 @@ now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # Tell the phone a switch really happened. Detached so a slow or unreachable
 # Telegram API can never stall the probe loop (and never leaves a zombie).
-notify() { # notify <state> <reason>
+notify() { # notify <mode> [state] [reason]
 	[ -x /usr/sbin/wan-notify ] || return 0
-	( /usr/sbin/wan-notify "$1" "$2" >/dev/null 2>&1 & )
+	( /usr/sbin/wan-notify "$@" >/dev/null 2>&1 & )
 }
 
 write_status() {
@@ -361,9 +361,15 @@ run_loop() {
 		case "$STATE" in
 		init)
 			if [ "$WAN_ONLINE" = up ]; then
-				prefer_isp "startup probe" && { STATE=isp; SINCE=$(now); }
+				prefer_isp "startup probe" && {
+					STATE=isp; SINCE=$(now)
+					notify init isp "watchdog restart"
+				}
 			elif [ "$fails" -ge "$FAIL_TRIES" ]; then
-				prefer_sim "startup probe: ISP unreachable" && { STATE=sim; SINCE=$(now); }
+				prefer_sim "startup probe: ISP unreachable" && {
+					STATE=sim; SINCE=$(now)
+					notify init sim "watchdog restart"
+				}
 			fi
 			;;
 		isp)

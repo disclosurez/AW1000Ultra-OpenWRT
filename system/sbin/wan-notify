@@ -109,21 +109,35 @@ compose_hb() {
 
 # A flapping ISP can switch every 30 s; keep at most one message per MUTE
 # seconds and report how many were held back.
+read_state() {
+	LAST_TS=-; LAST_ST=; SUPP=0; SENT_ST=
+	[ -r "$STATE_FILE" ] && read -r LAST_TS LAST_ST SUPP SENT_ST < "$STATE_FILE"
+	# migrate the 3-field format written before SENT_ST existed
+	if [ -z "$SENT_ST" ] && [ "${SUPP:-0}" = 0 ]; then
+		SENT_ST=$LAST_ST
+	fi
+}
+
+write_state() { # write_state <epoch> <state> <suppressed> [sent_state]
+	printf '%s %s %s %s\n' "$1" "$2" "$3" "${4:-}" > "$STATE_FILE"
+}
+
+mark_sent() { write_state "$(date +%s)" "$1" 0 "$1"; }
+
 may_send() { # may_send <state> -> 0 send, 1 suppressed
-	local last_ts="-" last_st="" supp=0 t n
+	local t n
 	[ "$MUTE" -gt 0 ] || return 0
-	[ -r "$STATE_FILE" ] && read -r last_ts last_st supp < "$STATE_FILE"
-	if [ "$last_ts" != "-" ] && [ -n "$last_ts" ]; then
-		t=$(( $(date +%s) - last_ts ))
+	read_state
+	if [ "$LAST_TS" != - ] && [ -n "$LAST_TS" ]; then
+		t=$(( $(date +%s) - LAST_TS ))
 		if [ "$t" -lt "$MUTE" ]; then
-			n=$(( ${supp:-0} + 1 ))
-			echo "$(date +%s) $1 $n" > "$STATE_FILE"
+			n=$(( ${SUPP:-0} + 1 ))
+			write_state "$(date +%s)" "$1" "$n" "$SENT_ST"
 			log "suppressed ($1, ${t}s into ${MUTE}s cooldown)"
 			return 1
 		fi
 	fi
-	echo "$(date +%s) $1 0" > "$STATE_FILE"
-	SUPP=${supp:-0}
+	write_state "$(date +%s)" "$1" 0 "$SENT_ST"
 	return 0
 }
 
@@ -142,7 +156,20 @@ sim|isp)
 	may_send "$1" || exit 0
 	msg=$(compose "$1" "${2:-manual}")
 	[ "${SUPP:-0}" -gt 0 ] && msg="$msg (+$SUPP suppressed)"
-	send_retry "$msg"
+	send_retry "$msg" && mark_sent "$1"
+	;;
+init)
+	# A watchdog restart must not leave the last alert lying: if the uplink
+	# settled somewhere other than what we last reported, say so. A real
+	# reboot has no state file (/tmp is RAM), so boots stay silent.
+	read_state
+	if [ -z "$SENT_ST" ]; then
+		log "boot — no notification"
+		exit 0
+	fi
+	[ "$SENT_ST" = "$2" ] && { log "init $2 already reported — silent"; exit 0; }
+	sleep 2
+	send_retry "$(compose "$2" "${3:-watchdog restart}")" && mark_sent "$2"
 	;;
 heartbeat)
 	[ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || exit 0

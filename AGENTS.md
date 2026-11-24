@@ -197,14 +197,17 @@ does not go unnoticed.
 
 | File | Role |
 |---|---|
-| `/usr/sbin/wan-notify` | `sim\|isp <reason>` · `heartbeat` · `test` · `chatid` · `status` |
+| `/usr/sbin/wan-notify` | `sim\|isp <reason>` · `init` · `heartbeat` · `test` · `chatid` · `status` |
 | `/etc/wan-notify.conf` | `TG_TOKEN`, `TG_CHAT` (comma-separated ok), `MUTE` — mode **600** |
 | `/usr/sbin/wan-failover` | `notify()` after each state transition (detached; never blocks the probe loop) |
 | cron | `0 9 * * * wan-notify heartbeat` — dead-man's switch: no message = no router |
 | log | `logger -t wan-notify`, `/tmp/wan-notify.log` (capped 64 KB) |
 
 - Sends only on a real transition (the loop already debounces with
-  `FAIL_TRIES`/`OK_TRIES`), never on boot.
+  `FAIL_TRIES`/`OK_TRIES`). A boot is silent (no state file in `/tmp`), but a
+  watchdog **restart** that leaves the uplink somewhere other than the last
+  reported state does send — otherwise the last alert keeps lying (e.g. a
+  manual `ifup isp` flips to SIM, then the restart returns to ISP silently).
 - The message goes out over whichever uplink just came up, so a switch *to* the
   SIM is reported over the SIM.
 - `MUTE` (default 300 s) keeps a flapping ISP from pinging every cycle; held-back
