@@ -331,11 +331,40 @@
 				'<div class="thermal-band" data-k="thermal-band">—</div>' +
 				'<div class="thermal-gauge"><span class="thermal-gauge-pin" data-k="thermal-pin"></span></div>' +
 				'<div class="thermal-scale"><span>25</span><span>55</span><span>75</span><span>95</span></div>' +
+				'<div class="thermal-spark"><svg viewBox="0 0 232 34" preserveAspectRatio="none" aria-hidden="true">' +
+					'<path class="thermal-spark-area" d=""/><path class="thermal-spark-line" d=""/></svg></div>' +
 				'<div class="thermal-sub" data-k="thermal-sub">SoC hotspot</div>' +
 			'</div>' +
 			'<div class="thermal-groups" data-k="thermal-groups"></div>' +
 		'</div>' +
 		'<div class="thermal-chips" data-k="thermal-chips"></div>';
+	}
+
+	/* SoC trend. Auto-scaled to the window's own range: on an absolute 25-95
+	   scale six hours of 43-46 C would be a flat line. */
+	function drawSpark(hist) {
+		var svg = $('.thermal-spark svg', thermal);
+		if (!svg || !hist.length) return;
+		var n = hist.length;
+		if (n < 2) return;
+
+		var lo = Math.min.apply(Math, hist);
+		var hi = Math.max.apply(Math, hist);
+		if (hi - lo < 5) { var mid = (hi + lo) / 2; lo = mid - 3; hi = mid + 3; }
+
+		var W = 232, H = 34, pad = 3, d = '';
+		for (var i = 0; i < n; i++) {
+			var x = (i * W) / (n - 1);
+			var y = H - pad - ((hist[i] - lo) / (hi - lo)) * (H - pad * 2);
+			d += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + y.toFixed(1);
+		}
+		$('.thermal-spark-line', svg).setAttribute('d', d);
+		$('.thermal-spark-area', svg).setAttribute('d', d + 'L' + W + ' ' + H + 'L0 ' + H + 'Z');
+
+		var mins = Math.round((n - 1) * 5);
+		svg.parentNode.setAttribute('title',
+			'SoC max, last ' + (mins >= 60 ? Math.round(mins / 60) + 'h' : mins + 'm')
+			+ ' · ' + (lo / 10).toFixed(1) + '–' + (hi / 10).toFixed(1) + ' °C (auto-scaled)');
 	}
 
 	function renderThermals(data) {
@@ -358,6 +387,20 @@
 		}
 		el = $('[data-k="thermal-pin"]', thermal);
 		if (el) el.style.left = tempPos(max).toFixed(1) + '%';
+
+		drawSpark(asArray(t.hist));
+
+		el = $('[data-k="thermal-sub"]', thermal);
+		if (el) {
+			var peak = (+t.peak || 0) / 10;
+			if (peak > 0) {
+				var at = t.peak_at ? new Date(t.peak_at * 1000) : null;
+				el.textContent = 'peak ' + peak.toFixed(1) + '°'
+					+ (at ? ' at ' + at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '');
+			} else {
+				el.textContent = 'SoC hotspot';
+			}
+		}
 
 		var groups = $('[data-k="thermal-groups"]', thermal);
 		if (groups) {

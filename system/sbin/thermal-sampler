@@ -1,0 +1,63 @@
+#!/bin/sh
+# thermal-sampler — one line of temperatures per run (cron, every 5 min).
+#
+#   <epoch> <soc> <cpu> <gpu> <pmic> <modem>     (degrees C, one decimal)
+#
+# Two consumers:
+#   - /tmp/thermal.hist   short RAM history behind the overview sparkline and
+#                         the "peak since boot" figure in the Thermals card
+#   - syslog              threshold crossings only (cool -> warm -> critical),
+#                         tagged "thermal", so they appear in System Log and are
+#                         shipped by the SIEM forwarder if it is enabled
+#
+# Everything lives in /tmp: the history is intentionally RAM-only (the eMMC is
+# small and RRD already lives there for the same reason), so "peak" means since
+# the last boot.
+
+HIST=/tmp/thermal.hist
+LEVEL=/tmp/thermal.level
+MAX_LINES=2016   # 7 days at 5-minute samples
+
+WARN=70
+CRIT=85
+
+readings=$(for z in /sys/class/thermal/thermal_zone*; do
+	[ -r "$z/temp" ] || continue
+	t=$(cat "$z/temp" 2>/dev/null)
+	n=$(cat "$z/type" 2>/dev/null)
+	# unwired probes report about -274 C
+	[ -n "$t" ] && [ "$t" -gt -40000 ] 2>/dev/null && echo "$n $t"
+done | awk '
+{
+	c = $2 / 1000
+	if ($1 == "soc_max") soc = c
+	else if ($1 ~ /^cpu_little/) { if (c > cpu) cpu = c }
+	else if ($1 ~ /^gpu/)        { if (c > gpu) gpu = c }
+	else if ($1 ~ /^pmic/)       { if (c > pmic) pmic = c }
+	else if ($1 ~ /^(md_|nrpa|ltepa|rf_ntc)/) { if (c > modem) modem = c }
+}
+END { printf "%.1f %.1f %.1f %.1f %.1f\n", soc, cpu, gpu, pmic, modem }')
+
+set -- $readings
+soc=${1:-0}; cpu=${2:-0}; gpu=${3:-0}; pmic=${4:-0}; modem=${5:-0}
+
+echo "$(date +%s) $soc $cpu $gpu $pmic $modem" >> "$HIST"
+
+if [ "$(wc -l < "$HIST")" -gt "$MAX_LINES" ]; then
+	tail -n "$MAX_LINES" "$HIST" > "$HIST.t" && mv "$HIST.t" "$HIST"
+fi
+
+# Threshold crossings, logged once per transition rather than every sample.
+now_level=cool
+[ "${soc%.*}" -ge "$WARN" ] && now_level=warm
+[ "${soc%.*}" -ge "$CRIT" ] && now_level=critical
+
+prev_level=$(cat "$LEVEL" 2>/dev/null)
+if [ "$now_level" != "$prev_level" ]; then
+	case "$now_level" in
+	critical) logger -t thermal -p daemon.err  "SoC ${soc} C — critical (>= ${CRIT} C)" ;;
+	warm)     logger -t thermal -p daemon.warn "SoC ${soc} C — warm (>= ${WARN} C)" ;;
+	cool)     [ -n "$prev_level" ] && logger -t thermal -p daemon.notice "SoC ${soc} C — back below ${WARN} C" ;;
+	esac
+	echo "$now_level" > "$LEVEL"
+fi

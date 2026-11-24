@@ -463,6 +463,15 @@ Page-specific fixes in this theme:
   degree (integer, so the JSON carries no float noise) and the bands are cool
   <55, warm <70, hot <85, critical ≥85 °C. `cooling_device*/cur_state > 0`
   becomes the "throttling" count in the card head.
+- Overview: the Thermals card also carries a **6 h sparkline** of SoC max and a
+  **peak since boot** line. History comes from `/usr/sbin/thermal-sampler`
+  (cron, every 5 min) appending `<epoch> <soc> <cpu> <gpu> <pmic> <modem>` to
+  `/tmp/thermal.hist` (capped at 2016 lines = 7 days) — RAM-only by design.
+  The same sampler logs **threshold crossings only** (cool → 70 warm → 85
+  critical) with `logger -t thermal`, so they reach System Log and the SIEM
+  forwarder without filling the ring buffer. Temperature is *not* in
+  `Statistics → Graphs`: collectd here is 5.11 without an exec/thermal plugin,
+  and `collectd-mod-exec` in the 19.07 feed is 5.12 and would upgrade the core.
 - Interfaces: page h3 promoted to a title; zone colors become a 3 px edge bar
   (inline `background-color` is overridden); mobile rows stack with actions below.
 - Realtime graphs: load series recolored (teal area + slate/amber lines) with the
@@ -1252,10 +1261,15 @@ probe-*.sh, test-*.sh                                                     ad-hoc
   rails, Modem/RF, DRAM) and a chip for each of the 22 usable
   `/sys/class/thermal` zones, plus a throttling count from `cooling_device`.
   Unwired probes that report `-274 °C` are filtered out, and temperatures are
-  sent as integer tenths so the JSON has no float noise. The System tile's
-  tooltip now carries the SoC temperature. This firmware exposes no `hwmon`
-  device and the vendor's own temperature page shows only the modem. Verified
-  at 1440 px and 390 px in headless Chromium against the live router.
+  sent as integer tenths so the JSON has no float noise. The card also shows a
+  6 h sparkline of SoC max and the peak since boot, backed by a 5-minute
+  `thermal-sampler` cron writing `/tmp/thermal.hist`; the same script logs
+  threshold crossings (70 / 85 °C) to syslog once per transition. The System
+  tile's tooltip carries the SoC temperature. This firmware exposes no `hwmon`
+  device, the vendor's own temperature page shows only the modem, and
+  `Statistics → Graphs` has no temperature series because the installed
+  collectd (5.11) lacks the plugin and the feed only offers 5.12. Verified at
+  1440 px and 390 px in headless Chromium against the live router.
 
 - **2026-11-24** — **Uplink switch notifications.** `wan-failover` now tells
   the phone when it actually switches uplink (ISP ↔ SIM) instead of only

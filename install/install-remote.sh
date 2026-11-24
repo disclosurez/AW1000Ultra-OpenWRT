@@ -66,6 +66,7 @@ put "$SRC/system/sbin/dnslog-clear"        /usr/sbin/dnslog-clear        0755
 put "$SRC/system/sbin/dnslog-rotate"       /usr/sbin/dnslog-rotate       0755
 put "$SRC/system/sbin/dnslog-report"       /usr/sbin/dnslog-report       0755
 put "$SRC/system/sbin/oui-update"          /usr/sbin/oui-update          0755
+put "$SRC/system/sbin/thermal-sampler"     /usr/sbin/thermal-sampler     0755
 
 log "data directories"
 mkdir -p /data/logs /data/dnscat /data/oui /data/portal /data/cloudflare/bin

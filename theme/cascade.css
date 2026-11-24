@@ -2682,7 +2682,18 @@ svg.iface-glyph.is-off { opacity: .45; }
 	color: var(--faint);
 	font-variant-numeric: tabular-nums;
 }
-.thermal-sub { margin-top: 9px; font-size: 11.5px; color: var(--muted); }
+.thermal-spark { margin-top: 11px; height: 34px; }
+.thermal-spark svg { display: block; width: 100%; height: 34px; overflow: visible; }
+.thermal-spark-line {
+	fill: none;
+	stroke: var(--band, var(--accent));
+	stroke-width: 1.6;
+	stroke-linejoin: round;
+	stroke-linecap: round;
+}
+.thermal-spark-area { fill: var(--band, var(--accent)); stroke: none; opacity: .1; }
+
+.thermal-sub { margin-top: 8px; font-size: 11.5px; color: var(--muted); }
 
 .thermal-groups { display: grid; gap: 8px; }
 .thermal-row {

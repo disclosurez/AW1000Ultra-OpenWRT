@@ -18,3 +18,6 @@
 # Uplink switch notices (Telegram). The daily line is a dead-man's switch:
 # if it stops arriving, the router is offline or wedged.
 0 9 * * * /usr/sbin/wan-notify heartbeat >/dev/null 2>&1
+
+# Thermal history for the overview sparkline + threshold events.
+*/5 * * * * /usr/sbin/thermal-sampler >/dev/null 2>&1

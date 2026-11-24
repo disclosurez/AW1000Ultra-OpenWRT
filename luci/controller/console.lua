@@ -426,6 +426,26 @@ end
 -- report a bogus -274 C when the probe is not wired, so anything below -40 C
 -- is dropped rather than shown as a plausible reading. cooling_device
 -- cur_state > 0 means something is actively being throttled.
+-- Short RAM trend behind the Thermals sparkline and the "peak since boot"
+-- figure. /usr/sbin/thermal-sampler appends one line per cron run (5 min), so
+-- seven days fits in 80 kB of tmpfs. Values are returned as integer tenths.
+local function thermal_trend(limit)
+	local vals, n, peak, peak_at = {}, 0, 0, 0
+	for line in readfile("/tmp/thermal.hist"):gmatch("[^\n]+") do
+		local t, soc = line:match("^(%d+)%s+([%d%.]+)")
+		if t and soc then
+			soc = tonumber(soc) or 0
+			n = n + 1
+			if soc > peak then peak, peak_at = soc, tonumber(t) end
+			vals[n] = math.floor(soc * 10 + 0.5)
+		end
+	end
+	local out, from = {}, n - limit + 1
+	if from < 1 then from = 1 end
+	for i = from, n do out[#out + 1] = vals[i] end
+	return out, math.floor(peak * 10 + 0.5), peak_at, n
+end
+
 local function thermal_status()
 	local fs = require "nixio.fs"
 	local list, hottest = {}, nil
@@ -455,7 +475,17 @@ local function thermal_status()
 		if st and st > 0 then cooling = cooling + 1 end
 	end
 
-	return { sensors = list, max = hottest or 0, cooling = cooling }
+	local hist, peak, peak_at, samples = thermal_trend(72)
+
+	return {
+		sensors = list,
+		max = hottest or 0,
+		cooling = cooling,
+		hist = hist,          -- last 72 samples, tenths
+		peak = peak,          -- since boot, tenths
+		peak_at = peak_at,
+		samples = samples
+	}
 end
 
 function action_vitals()
