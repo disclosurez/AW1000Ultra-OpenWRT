@@ -5,6 +5,11 @@
 > replaced with placeholders (`<router-password>`, `example.com`, `<wan-ip>`, …).
 > The step-by-step replication guide is [`docs/INSTALL.md`](docs/INSTALL.md).
 
+> **Commits.** Every commit in this repository is authored and committed as
+> `disclosurez <42372412+disclosurez@users.noreply.github.com>`. The repo config
+> already sets this — never override the identity per-commit (e.g.
+> `git -c user.name=...`).
+
 This directory holds the scripts and files used to manage the router at
 `192.168.0.1`. Read this before changing anything.
 
