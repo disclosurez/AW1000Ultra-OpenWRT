@@ -265,10 +265,28 @@ line. That is why:
 Only the active uplink can be tested: a parked SIM has no data path, so
 `netspeed now sim` refuses unless `wanfailover.status` says `state=sim`.
 
+**The number is the router's, not the line's.** A test terminates TCP/TLS on
+the router's own CPU, while traffic forwarded for LAN clients goes through the
+MTK HNAT fast path. Measured here: the card reads 95-131 Mbps, `speedtest-go`
+with 8 threads does no better, CPU sits at 85 % on 4 cores — yet `eth1` carried
+**317 Mbps rx / 212 Mbps tx** (30 s RRD samples) for a client at the same time.
+So the card is a *floor* and a fair ISP-vs-SIM comparison, not the line's
+capacity; the card says so in its footer. The SIM (~20-60 Mbps) is far below the
+ceiling, so SIM numbers are accurate.
+
+Two engines (`option engine`):
+
+| engine | what | cost |
+|---|---|---|
+| `fast` (default) | fast.com / Netflix OCA: loops ~528 kB chunks over `fast_conns` (4) connections for `fast_duration` (6 s). **Download only** | ~6 s, ~90 MB |
+| `speedtest` | speedtest-go: download + upload + jitter, fixed 10 s + 10 s | ~27 s, ~175-200 MB |
+
 ```bash
-/usr/sbin/netspeed now isp       # manual, ignores the interval
-/usr/sbin/netspeed status        # last 10 results
-/usr/sbin/netspeed list          # nearest servers (fill in `server` to pin one)
+/usr/sbin/netspeed now isp              # configured engine, ignores the interval
+/usr/sbin/netspeed now isp speedtest    # full up/down run
+/usr/sbin/netspeed now isp fast
+/usr/sbin/netspeed status               # last 10 results
+/usr/sbin/netspeed list                 # nearest speedtest.net servers
 logread -e netspeed | tail
 ```
 
@@ -1293,6 +1311,18 @@ probe-*.sh, test-*.sh                                                     ad-hoc
 ```
 
 ## Changelog
+- **2026-11-24** — **fast.com engine, and an honest label for the numbers.**
+  `netspeed` gained a second engine: `fast` (default) asks fast.com for Netflix
+  OCA targets and loops ~528 kB chunks over 4 connections for 6 s — 6.4 s and
+  89 MB, versus 27 s and 175 MB for `speedtest-go`, and it read 125-131 Mbps
+  against 95-116 on the same link. It is download-only, so `up` is `null` and
+  the card shows `—`; `netspeed now isp speedtest` still does the full run.
+  The Status card is now labelled explicitly: a router-side test terminates
+  TLS on 4 ARM cores (85 % CPU at 125 Mbps) while forwarded client traffic
+  uses the HNAT fast path — `eth1` carried 317 Mbps rx / 212 Mbps tx for a
+  client while the card read ~120. The footer says it is a floor and an
+  ISP-vs-SIM comparison, not the line's capacity.
+
 
 - **2026-11-24** — **Throughput measurements + a real theme bug.** Status →
   Overview gains a **Speed tests** card and every uplink transition triggers a

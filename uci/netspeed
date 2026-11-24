@@ -25,5 +25,14 @@ config settings 'settings'
 	# last 24 h. 0 disables the guard.
 	option data_guard_mb '0'
 
-	# Optional fixed server id (netspeed list). Empty picks the nearest.
+	# fast (fast.com, download only, ~6 s / ~90 MB) or speedtest
+	# (speedtest.net via speedtest-go, up + down + jitter, ~20 s / ~200 MB).
+	option engine 'fast'
+
+	# fast.com: seconds to download and concurrent connections.
+	option fast_duration '6'
+	option fast_conns '4'
+
+	# Optional fixed speedtest.net server id (netspeed list). Empty picks the
+	# nearest. Ignored by the fast.com engine.
 	option server ''

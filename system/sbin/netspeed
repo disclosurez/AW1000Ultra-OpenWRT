@@ -1,15 +1,19 @@
 #!/bin/sh
-# netspeed — speedtest.net measurements from the router, per uplink.
+# netspeed — throughput measurements from the router, per uplink.
 #
-#   netspeed now [isp|sim]    run one test immediately (manual, unthrottled)
-#   netspeed auto <isp|sim>   called by wan-failover: respects the interval
-#   netspeed status           last result per link
-#   netspeed list             nearest speedtest.net servers
+#   netspeed now [isp|sim] [fast|speedtest]   run one test immediately
+#   netspeed auto <isp|sim>                   failover-triggered, throttled
+#   netspeed status                           last results
+#   netspeed list                             nearest speedtest.net servers
+#
+# Two engines:
+#   fast       fast.com (Netflix OCA targets): loops ~528 kB chunks over 4
+#              connections for a few seconds. Download only, ~6 s, ~90 MB.
+#   speedtest  speedtest-go against speedtest.net: download + upload + jitter,
+#              fixed 10 s + 10 s, ~200 MB.
 #
 # Results are appended to /data/netspeed/results.tsv and the latest per-link
-# JSON is rewritten for the Status page. A test is a real 10 s download and a
-# 10 s upload, so it moves ~50-250 MB: that is why auto runs are throttled per
-# link and the SIM has its own interval and an optional data guard.
+# JSON is rewritten for the Status page.
 
 BIN=/data/netspeed/bin/speedtest-go
 DATA=/data/netspeed
@@ -18,6 +22,11 @@ LOCK=/tmp/netspeed.lock
 STATUS=/tmp/netspeed.status
 FAIL=/tmp/wanfailover.status
 LOG=/tmp/netspeed.log
+
+# Public token fast.com's own web client uses; the API issues short-lived
+# per-target URLs from it, so there is nothing to rotate here.
+FAST_TOKEN=YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm
+FAST_UA="Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
 TAG=netspeed
 
@@ -49,13 +58,97 @@ sim_mb_24h() {
 		'$2 == "sim" && $1 >= since { s += $10 } END { printf "%d", s }' "$TSV" 2>/dev/null
 }
 
-run_test() { # run_test <link>
-	local link=$1 dev json rc ts rx0 tx0 rx1 tx1 mb srv dl ul ping jitter sname isp ip
+# fast.com. Each request returns a capped chunk (~528 kB), so the loop keeps
+# asking until the window closes — same thing fast-cli does.
+fast_test() { # sets FAST_DOWN FAST_PING FAST_SERVER FAST_ISPSITE FAST_IP FAST_MB
+	local dur conns urls u first lat i deadline start end total
+	dur=$(uci_g fast_duration); [ -n "$dur" ] || dur=6
+	conns=$(uci_g fast_conns); [ -n "$conns" ] || conns=4
+
+	curl -s -m 12 -H "User-Agent: $FAST_UA" \
+		"https://api.fast.com/netflix/speedtest/v2?https=true&token=$FAST_TOKEN&urlCount=$conns" \
+		-o /tmp/fast.json 2>/dev/null || return 1
+
+	urls=$(jsonfilter -i /tmp/fast.json -e '@.targets[*].url' 2>/dev/null)
+	[ -n "$urls" ] || return 1
+
+	first=$(printf '%s\n' "$urls" | head -1)
+	lat=$(curl -s -o /dev/null -m 6 -w '%{time_connect}' -H "User-Agent: $FAST_UA" "$first" 2>/dev/null)
+	FAST_SERVER=$(jsonfilter -i /tmp/fast.json -e '@.targets[0].location.city' 2>/dev/null)
+	FAST_ISPSITE=$(jsonfilter -i /tmp/fast.json -e '@.client.location.city' 2>/dev/null)
+	FAST_IP=$(jsonfilter -i /tmp/fast.json -e '@.client.ip' 2>/dev/null)
+
+	rm -f /tmp/fast.b.*
+	deadline=$(( $(date +%s) + dur ))
+	start=$(date +%s)
+	i=0
+	for u in $urls; do
+		i=$((i + 1))
+		(
+			tot=0
+			while [ "$(date +%s)" -lt "$deadline" ]; do
+				n=$(curl -s -o /dev/null --max-time 15 -H "User-Agent: $FAST_UA" \
+					-w '%{size_download}' "$u" 2>/dev/null)
+				[ -n "$n" ] || break
+				tot=$((tot + n))
+			done
+			echo "$tot" > "/tmp/fast.b.$i"
+		) &
+		[ "$i" -ge "$conns" ] && break
+	done
+	wait
+
+	end=$(date +%s)
+	[ "$end" -gt "$start" ] || end=$((start + 1))
+	total=$(cat /tmp/fast.b.* 2>/dev/null | awk '{s += $1} END { printf "%d", s }')
+	[ "${total:-0}" -gt 0 ] || return 1
+
+	FAST_DOWN=$(awk -v b="$total" -v t="$((end - start))" 'BEGIN { printf "%d", b * 8 / t }')
+	FAST_PING=$(awk -v l="${lat:-0}" 'BEGIN { printf "%.1f", l * 1000 }')
+	FAST_MB=$(( total / 1048576 ))
+	rm -f /tmp/fast.b.* /tmp/fast.json
+	return 0
+}
+
+speedtest_test() { # sets ST_* from speedtest-go's JSON
+	local json=/tmp/netspeed.json srv rc jf
+	srv=$(uci_g server)
+	if [ -n "$srv" ]; then
+		timeout 180 "$BIN" --json --source "$ST_DEV" --server "$srv" > "$json" 2>/tmp/netspeed.err
+	else
+		timeout 180 "$BIN" --json --source "$ST_DEV" > "$json" 2>/tmp/netspeed.err
+	fi
+	rc=$?
+	[ "$rc" = 0 ] && [ -s "$json" ] || { log "speedtest-go failed (rc=$rc)"; return 1; }
+
+	jf() { jsonfilter -i "$json" -e "$1" 2>/dev/null | head -1; }
+	ST_DOWN=$(jf '@.servers[0].dl_speed')
+	ST_UP=$(jf '@.servers[0].ul_speed')
+	ST_PING_NS=$(jf '@.servers[0].latency')
+	ST_JIT_NS=$(jf '@.servers[0].jitter')
+	ST_DLNS=$(jf '@.servers[0].test_duration.download')
+	ST_ULNS=$(jf '@.servers[0].test_duration.upload')
+	ST_SERVER=$(jf '@.servers[0].name')
+	ST_ISP=$(jf '@.user_info.Isp')
+	ST_IP=$(jf '@.user_info.IP')
+	[ -n "$ST_DOWN" ] || { log "speedtest-go produced no data"; return 1; }
+	return 0
+}
+
+run_test() { # run_test <link> [engine]
+	local link=$1 engine=$2 dev json ts dl ul ping jitter sname isp ip mb
+	[ -n "$engine" ] || engine=$(uci_g engine)
+	[ -n "$engine" ] || engine=fast
+
 	dev=$(dev_for "$link")
 	[ -n "$dev" ] || { log "$link: cannot resolve a device"; return 1; }
 	[ -r "/sys/class/net/$dev/statistics/rx_bytes" ] || { log "$link: $dev is not up"; return 1; }
 	[ "$(read_status state)" = "$link" ] || { log "$link: not the active uplink, skipped"; return 1; }
-	[ -x "$BIN" ] || { log "missing $BIN"; return 1; }
+
+	if [ "$engine" = speedtest ] && [ ! -x "$BIN" ]; then
+		log "speedtest-go missing, falling back to fast.com"
+		engine=fast
+	fi
 
 	if ! mkdir "$LOCK" 2>/dev/null; then
 		log "another test is already running"
@@ -63,65 +156,51 @@ run_test() { # run_test <link>
 	fi
 	trap 'rmdir "$LOCK" 2>/dev/null' EXIT INT TERM
 
-	echo "running link=$link started=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATUS"
-	log "starting $link test on $dev"
+	echo "running link=$link engine=$engine started=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATUS"
+	log "starting $engine test on $link ($dev)"
 
-	json=/tmp/netspeed.json
-	srv=$(uci_g server)
-	if [ -n "$srv" ]; then
-		timeout 180 "$BIN" --json --source "$dev" --server "$srv" > "$json" 2>/tmp/netspeed.err
+	if [ "$engine" = fast ]; then
+		fast_test || { log "fast.com test failed"; rm -f "$STATUS"; return 1; }
+		dl=$FAST_DOWN; ul=0; ping=$FAST_PING; jitter=0
+		sname=$FAST_SERVER; isp=$FAST_ISPSITE; ip=$FAST_IP; mb=$FAST_MB
 	else
-		timeout 180 "$BIN" --json --source "$dev" > "$json" 2>/tmp/netspeed.err
+		ST_DEV=$dev
+		speedtest_test || { rm -f "$STATUS"; return 1; }
+		dl=$ST_DOWN; ul=$ST_UP
+		ping=$(awk -v v="$ST_PING_NS" 'BEGIN { printf "%.1f", v / 1000000 }')
+		jitter=$(awk -v v="$ST_JIT_NS" 'BEGIN { printf "%.1f", v / 1000000 }')
+		dl=$(awk -v v="$dl" 'BEGIN { printf "%d", v + 0.5 }')
+		ul=$(awk -v v="$ul" 'BEGIN { printf "%d", v + 0.5 }')
+		# Volume of the test itself: interface counters would also count every
+		# other client on the LAN, so they cannot be attributed to the test.
+		mb=$(awk -v d="$dl" -v dn="$ST_DLNS" -v u="$ul" -v un="$ST_ULNS" \
+			'BEGIN { printf "%d", (d * dn + u * un) / 8e15 }')
+		sname=$ST_SERVER; isp=$ST_ISP; ip=$ST_IP
 	fi
-	rc=$?
 
-	if [ "$rc" != 0 ] || [ ! -s "$json" ]; then
-		log "$link: test failed (rc=$rc) $(head -c 120 /tmp/netspeed.err 2>/dev/null)"
-		rm -f "$STATUS"
-		return 1
-	fi
-
-	jf() { jsonfilter -i "$json" -e "$1" 2>/dev/null | head -1; }
-	dl=$(jf '@.servers[0].dl_speed')
-	ul=$(jf '@.servers[0].ul_speed')
-	lat=$(jf '@.servers[0].latency')
-	jit=$(jf '@.servers[0].jitter')
-	dlns=$(jf '@.servers[0].test_duration.download')
-	ulns=$(jf '@.servers[0].test_duration.upload')
-	sname=$(jf '@.servers[0].name')
-	isp=$(jf '@.user_info.Isp')
-	ip=$(jf '@.user_info.IP')
-
-	[ -n "$dl" ] || { log "$link: test produced no data"; rm -f "$STATUS" "$json"; return 1; }
-
-	# bps -> integer, ns -> ms with one decimal
-	dl=$(awk -v v="$dl" 'BEGIN { printf "%d", v + 0.5 }')
-	ul=$(awk -v v="$ul" 'BEGIN { printf "%d", v + 0.5 }')
-	ping=$(awk -v v="$lat" 'BEGIN { printf "%.1f", v / 1000000 }')
-	jitter=$(awk -v v="$jit" 'BEGIN { printf "%.1f", v / 1000000 }')
 	ts=$(date +%s)
 	sname=$(printf '%s' "$sname" | sed 's/\t/ /g')
+	isp=$(printf '%s' "$isp" | sed 's/\t/ /g')
 
-	# Volume of the test itself. Interface counters cannot be used: eth1 also
-	# carries every other client on the LAN, so the delta over 30 s says nothing
-	# about this transfer.
-	mb=$(awk -v d="$dl" -v dn="$dlns" -v u="$ul" -v un="$ulns" \
-		'BEGIN { printf "%d", (d * dn + u * un) / 8e15 }')
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$ts" "$link" "$dl" "$ul" "$ping" "$jitter" "$sname" "$isp" "$ip" "$mb" "$engine" >> "$TSV"
 
-	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-		"$ts" "$link" "$dl" "$ul" "$ping" "$jitter" "$sname" "$isp" "$ip" "$mb" >> "$TSV"
-
-	# keep the history bounded (2 000 tests is years of data)
 	if [ "$(wc -l < "$TSV")" -gt 2000 ]; then
 		tail -n 2000 "$TSV" > "$TSV.t" && mv "$TSV.t" "$TSV"
 	fi
 
-	printf '{"link":"%s","ts":%s,"down":%s,"up":%s,"ping":%s,"jitter":%s,"server":"%s","isp":"%s","ip":"%s","mb":%s}\n' \
-		"$link" "$ts" "$dl" "$ul" "$ping" "$jitter" "$sname" "$isp" "$ip" "$mb" \
-		> "$DATA/latest.$link.json"
+	if [ "$engine" = fast ]; then
+		printf '{"link":"%s","ts":%s,"down":%s,"up":null,"ping":%s,"jitter":null,"server":"%s","isp":"%s","ip":"%s","mb":%s,"engine":"fast.com"}\n' \
+			"$link" "$ts" "$dl" "$ping" "$sname" "$isp" "$ip" "$mb" \
+			> "$DATA/latest.$link.json"
+	else
+		printf '{"link":"%s","ts":%s,"down":%s,"up":%s,"ping":%s,"jitter":%s,"server":"%s","isp":"%s","ip":"%s","mb":%s,"engine":"speedtest.net"}\n' \
+			"$link" "$ts" "$dl" "$ul" "$ping" "$jitter" "$sname" "$isp" "$ip" "$mb" \
+			> "$DATA/latest.$link.json"
+	fi
 
-	rm -f "$STATUS" "$json"
-	log "$link: $(awk -v v="$dl" 'BEGIN{printf "%.1f", v/1000000}') Mbps down, $(awk -v v="$ul" 'BEGIN{printf "%.1f", v/1000000}') Mbps up, ${ping} ms, ${mb} MB used"
+	rm -f "$STATUS"
+	log "$link ($engine): $(awk -v v="$dl" 'BEGIN { printf "%.1f", v / 1000000 }') Mbps down, ${mb} MB"
 }
 
 auto_test() { # auto_test <link>
@@ -158,23 +237,23 @@ auto_test() { # auto_test <link>
 
 case "$1" in
 now)
-	run_test "${2:-$(read_status state)}"
+	run_test "${2:-$(read_status state)}" "$3"
 	;;
 auto)
 	auto_test "$2"
 	;;
 status)
 	[ -s "$TSV" ] || { echo "no tests yet ($TSV)"; exit 0; }
-	printf '%-4s %-19s %10s %10s %7s %7s  %s\n' LINK WHEN DOWN UP PING JITTER SERVER
-	awk -F'\t' '{ printf "%-4s %-19s %7.1f Mb %7.1f Mb %5s ms %5s ms  %s (%s Mb)\n", \
-		toupper($2), strftime("%Y-%m-%d %H:%M", $1, 1), $3/1000000, $4/1000000, $5, $6, $7, $10 }' "$TSV" | tail -10
+	printf '%-4s %-16s %10s %10s %7s %7s  %-13s %s\n' LINK WHEN DOWN UP PING JITTER ENGINE SERVER
+	awk -F'\t' '{ printf "%-4s %-16s %7.1f Mb %7.1f Mb %5s ms %5s ms  %-13s %s (%s Mb)\n", \
+		toupper($2), strftime("%Y-%m-%d %H:%M", $1, 1), $3/1000000, $4/1000000, $5, $6, $11, $7, $10 }' "$TSV" | tail -10
 	;;
 list)
 	[ -x "$BIN" ] || { echo "missing $BIN" >&2; exit 1; }
 	"$BIN" --list | head -20
 	;;
 *)
-	echo "usage: $0 now [isp|sim] | auto <isp|sim> | status | list" >&2
+	echo "usage: $0 now [isp|sim] [fast|speedtest] | auto <isp|sim> | status | list" >&2
 	exit 1
 	;;
 esac

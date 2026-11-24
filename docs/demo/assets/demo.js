@@ -131,8 +131,9 @@
 
 		return `<section class="speed">
 			<div class="speed-head"><span class="speed-title">Speed tests</span>
-				<span class="speed-note">${state.speedRunning ? 'testing — about 30 s, uses real data' : 'speedtest.net · runs on failover'}</span></div>
+				<span class="speed-note">${state.speedRunning ? 'testing — a few seconds, uses real data' : 'fast.com · runs on failover'}</span></div>
 			<div class="speed-rows">${rows}</div>
+			<div class="speed-foot">Router-side measurement — traffic forwarded to clients uses the hardware fast path and can be several times faster. Read it as a floor and as an ISP-vs-SIM comparison, not as the line's capacity.</div>
 		</section>`;
 	}
 	function empty(title, text, iconId = 'i-grid') {

@@ -294,7 +294,12 @@
 			'<span class="speed-title">Speed tests</span>' +
 			'<span class="speed-note" data-k="speed-note">speedtest.net</span>' +
 		'</div>' +
-		'<div class="speed-rows" data-k="speed-rows"></div>';
+		'<div class="speed-rows" data-k="speed-rows"></div>' +
+		'<div class="speed-foot" data-k="speed-foot">' +
+			'Router-side measurement — traffic forwarded to clients uses the hardware ' +
+			'fast path and can be several times faster. Read it as a floor and as an ' +
+			'ISP-vs-SIM comparison, not as the line\'s capacity.' +
+		'</div>';
 	}
 
 	function fmtMbps(bps) {
@@ -345,6 +350,8 @@
 			    : 'no test recorded yet');
 		if (res) {
 			meta.title = (res.ip || '') + ' via ' + (res.server || '')
+				+ (res.engine ? ' · ' + res.engine : '')
+				+ (res.up ? '' : ' · download only')
 				+ ' · ' + new Date(res.ts * 1000).toLocaleString();
 		}
 		row.appendChild(meta);
@@ -365,9 +372,11 @@
 
 		var note = $('[data-k="speed-note"]', speed);
 		if (note) {
+			var engine = (data.isp && data.isp.engine) || (data.sim && data.sim.engine) || '';
 			note.textContent = data.running
-				? 'testing — about 30 s, uses real data'
-				: 'speedtest.net · runs on failover';
+				? 'testing — a few seconds, uses real data'
+				: (engine ? engine + ' · runs on failover' : 'runs on failover');
+			note.title = engine ? 'Engine: ' + engine : '';
 		}
 
 		host.innerHTML = '';
