@@ -455,6 +455,14 @@ Page-specific fixes in this theme:
 
 - Overview: vendor `Status` becomes **Overview**; hero + 3-column cards; empty
   `DSL`/`Wireless`/UPnP blocks are hidden; live RX/TX sparkline.
+- Overview: **Thermals** card under the WAN strip — SoC hotspot gauge, one bar
+  per sensor group (CPU cluster / GPU / PMIC rails / Modem+RF / DRAM) and a chip
+  per zone. Fed by `thermal` in the `vitals` JSON, which reads
+  `/sys/class/thermal/thermal_zone*`: the SoC exposes 22 usable zones, and the
+  ones that report `-274 °C` when unwired are dropped. Values are tenths of a
+  degree (integer, so the JSON carries no float noise) and the bands are cool
+  <55, warm <70, hot <85, critical ≥85 °C. `cooling_device*/cur_state > 0`
+  becomes the "throttling" count in the card head.
 - Interfaces: page h3 promoted to a title; zone colors become a 3 px edge bar
   (inline `background-color` is overridden); mobile rows stack with actions below.
 - Realtime graphs: load series recolored (teal area + slate/amber lines) with the
@@ -1236,6 +1244,18 @@ probe-*.sh, test-*.sh                                                     ad-hoc
 ```
 
 ## Changelog
+
+- **2026-11-24** — **Thermals on the Overview page.** The console theme's
+  Overview gains a **Thermals** card fed by a new `thermal` block in
+  `/admin/status/vitals`: a SoC-hotspot gauge (25–95 °C scale, colour-banded
+  cool/warm/hot/critical), one bar per sensor group (CPU cluster, GPU, PMIC
+  rails, Modem/RF, DRAM) and a chip for each of the 22 usable
+  `/sys/class/thermal` zones, plus a throttling count from `cooling_device`.
+  Unwired probes that report `-274 °C` are filtered out, and temperatures are
+  sent as integer tenths so the JSON has no float noise. The System tile's
+  tooltip now carries the SoC temperature. This firmware exposes no `hwmon`
+  device and the vendor's own temperature page shows only the modem. Verified
+  at 1440 px and 390 px in headless Chromium against the live router.
 
 - **2026-11-24** — **Uplink switch notifications.** `wan-failover` now tells
   the phone when it actually switches uplink (ISP ↔ SIM) instead of only

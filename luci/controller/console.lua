@@ -421,6 +421,43 @@ function action_vpnstatus()
 	})
 end
 
+-- Thermal zones. This SoC exposes ~23 of them under /sys/class/thermal:
+-- CPU cluster, GPU, SoC hotspot, PMIC rails, modem/RF, DRAM, crystal. A few
+-- report a bogus -274 C when the probe is not wired, so anything below -40 C
+-- is dropped rather than shown as a plausible reading. cooling_device
+-- cur_state > 0 means something is actively being throttled.
+local function thermal_status()
+	local fs = require "nixio.fs"
+	local list, hottest = {}, nil
+
+	for z in fs.glob("/sys/class/thermal/thermal_zone*") do
+		local raw = (readfile(z .. "/temp") or ""):match("^%s*(-?%d+)")
+		local name = (readfile(z .. "/type") or ""):gsub("%s+$", "")
+		local t = tonumber(raw)
+		if t and name ~= "" and t > -40000 then
+			-- tenths of a degree: 45241 -> 452 (45.2 C). Kept as an integer so
+			-- the JSON has no float noise; the browser divides by 10.
+			local c = math.floor(t / 100)
+			list[#list + 1] = {
+				name = name,
+				c = c,
+				id = tonumber(z:match("(%d+)$")) or 0
+			}
+			if not hottest or c > hottest then hottest = c end
+		end
+	end
+
+	table.sort(list, function(a, b) return a.id < b.id end)
+
+	local cooling = 0
+	for d in fs.glob("/sys/class/thermal/cooling_device*") do
+		local st = tonumber((readfile(d .. "/cur_state") or ""):match("^%s*(%d+)"))
+		if st and st > 0 then cooling = cooling + 1 end
+	end
+
+	return { sensors = list, max = hottest or 0, cooling = cooling }
+end
+
 function action_vitals()
 	local http = require "luci.http"
 	local util = require "luci.util"
@@ -448,6 +485,7 @@ function action_vitals()
 		clients = lan_clients(),
 		wifi = wifi_status(),
 		vpn = vpn_status(),
-		parental = parental_status()
+		parental = parental_status(),
+		thermal = thermal_status()
 	})
 end

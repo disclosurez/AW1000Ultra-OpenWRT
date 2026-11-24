@@ -334,7 +334,7 @@ one_shot() {
 }
 
 run_loop() {
-	local fails=0 oks=0
+	local fails=0 oks=0 prev
 	STATE=init ACTIVE=unknown SINCE=- CHECKS=0 FAILS=0 WAN_ONLINE=unknown SIM_PARKED=unknown
 	logger -t "$TAG" "watchdog started (ISP $WAN_DEV, SIM $MODEM_DEV)"
 	restore_modem_rf "watchdog start"
@@ -361,23 +361,26 @@ run_loop() {
 		case "$STATE" in
 		init)
 			if [ "$WAN_ONLINE" = up ]; then
-				prefer_isp "startup probe" && {
+				if prefer_isp "startup probe"; then
+					prev=$SINCE
 					STATE=isp; SINCE=$(now)
-					notify init isp "watchdog restart"
-				}
+					notify init isp "watchdog restart" "$prev"
+				fi
 			elif [ "$fails" -ge "$FAIL_TRIES" ]; then
-				prefer_sim "startup probe: ISP unreachable" && {
+				if prefer_sim "startup probe: ISP unreachable"; then
+					prev=$SINCE
 					STATE=sim; SINCE=$(now)
-					notify init sim "watchdog restart"
-				}
+					notify init sim "watchdog restart" "$prev"
+				fi
 			fi
 			;;
 		isp)
 			if [ "$WAN_ONLINE" = down ] && [ "$fails" -ge "$FAIL_TRIES" ]; then
-				prefer_sim "ISP down ${fails}x" && {
+				if prefer_sim "ISP down ${fails}x"; then
+					prev=$SINCE
 					STATE=sim; SINCE=$(now)
-					notify sim "ISP down ${fails}x"
-				}
+					notify sim "ISP down ${fails}x" "$prev"
+				fi
 			else
 				# ISP healthy: keep our metric on top and the SIM parked
 				set_route "$WAN_DEV" "$(dev_gw_any "$WAN_DEV" "$WAN_IFACE")" "$ISP_UP"
@@ -386,10 +389,11 @@ run_loop() {
 			;;
 		sim)
 			if [ "$WAN_ONLINE" = up ] && [ "$oks" -ge "$OK_TRIES" ]; then
-				prefer_isp "ISP recovered ${oks}x" && {
+				if prefer_isp "ISP recovered ${oks}x"; then
+					prev=$SINCE
 					STATE=isp; SINCE=$(now)
-					notify isp "ISP recovered ${oks}x"
-				}
+					notify isp "ISP recovered ${oks}x" "$prev"
+				fi
 			else
 				set_route "$MODEM_DEV" "$(dev_gw "$MODEM_DEV")" "$SIM_UP"
 				set_route "$WAN_DEV" "$(dev_gw_any "$WAN_DEV" "$WAN_IFACE")" "$ISP_DOWN"

@@ -47,11 +47,18 @@ cfgfile() { # cfgfile <url> [data ...]  -> path (0600, caller removes)
 	echo "$f"
 }
 
-tg_one() { # tg_one <chat_id> <encoded text> -> 0 on HTTP 200
+tg_one() { # tg_one <chat_id> <encoded html text> -> 0 on HTTP 200
 	local f code resp rc
 	resp=/tmp/wan-notify.reply
-	f=$(cfgfile "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-		"chat_id=$1" "text=$2") || return 1
+	f=$(mktemp /tmp/wan-notify.XXXXXX) || return 1
+	chmod 600 "$f"
+	{
+		printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_TOKEN"
+		printf 'data = "chat_id=%s"\n' "$1"
+		printf 'data = "parse_mode=HTML"\n'
+		printf 'data = "disable_web_page_preview=true"\n'
+		printf 'data = "text=%s"\n' "$2"
+	} > "$f"
 	code=$(curl -4 -s -m 10 -o "$resp" -w '%{http_code}' --config "$f" 2>/dev/null)
 	rc=$?
 	rm -f "$f"
@@ -84,41 +91,105 @@ send_retry() { # send_retry <text>
 	return 1
 }
 
-pub_ip() { # public egress address of whatever uplink is currently active
-	local ip
-	ip=$(curl -4 -s -m 6 https://cloudflare.com/cdn-cgi/trace 2>/dev/null \
-		| sed -n 's/^ip=//p' | head -1)
-	case "$ip" in
-	''|*[!0-9.]*) ip='' ;;
-	esac
-	echo "$ip"
+dur() { # dur <seconds> -> "4h 31m" / "6m 12s" / "45s"
+	local s=${1:-0} d h m
+	case "$s" in ''|*[!0-9]*) return 0 ;; esac
+	[ "$s" -gt 0 ] || { echo "0s"; return 0; }
+	d=$((s / 86400)); h=$(( (s % 86400) / 3600 )); m=$(( (s % 3600) / 60 ))
+	if [ "$d" -gt 0 ]; then echo "${d}d ${h}h"
+	elif [ "$h" -gt 0 ]; then echo "${h}h ${m}m"
+	elif [ "$m" -gt 0 ]; then echo "${m}m $((s % 60))s"
+	else echo "${s}s"
+	fi
 }
 
-compose() { # compose <state> <reason>
-	local st=$1 why=$2 head wip mip pub
-	case "$st" in
-	sim) head='📶 Uplink → SIM (mobile data)' ;;
-	isp) head='🔌 Uplink → ISP (wired)' ;;
-	*)   head="Uplink → $st" ;;
+epoch_of() { # epoch_of <ISO8601Z> -> epoch (empty if unusable)
+	case "$1" in ''|'-') return 0 ;; esac
+	date -u -D '%Y-%m-%dT%H:%M:%SZ' -d "$1" +%s 2>/dev/null
+}
+
+esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+get_pub() { # sets PUB (+ PUB_LOC); silent when the lookup fails
+	local t
+	t=$(curl -4 -s -m 6 https://cloudflare.com/cdn-cgi/trace 2>/dev/null)
+	PUB=$(printf '%s\n' "$t" | sed -n 's/^ip=//p' | head -1)
+	PUB_LOC=$(printf '%s\n' "$t" | sed -n 's/^loc=//p' | head -1)
+	case "$PUB" in
+	''|*[!0-9.]*) PUB='' PUB_LOC='' ;;
 	esac
+}
+
+pretty_reason() { # "ISP down 2x" -> "ISP failed 2 probes"
+	echo "$1" | sed -e 's/ISP down \([0-9]*\)x/ISP failed \1 probes/' \
+	               -e 's/ISP recovered \([0-9]*\)x/ISP answered \1 probes/'
+}
+
+compose() { # compose <state> <reason> [previous_since]
+	local st=$1 why=$2 prev=$3 wip mip head note ago pe clock
 	wip=$(sval wan_ip); mip=$(sval modem_ip)
-	[ -n "$wip" ] || wip=-
-	[ -n "$mip" ] || mip=-
-	pub=$(pub_ip)
-	printf '%s\nreason: %s\nSIM: %s · ISP: %s' \
-		"$head" "${why:-manual}" "$mip" "$wip"
-	[ -n "$pub" ] && printf '\npublic: %s' "$pub"
-	printf '\n%s' "$(now)"
+	why=$(pretty_reason "${why:-manual}")
+	pe=$(epoch_of "$prev")
+	[ -n "$pe" ] && ago=$(dur $(( $(date +%s) - pe )))
+	clock=$(date -u +%H:%M:%S)
+	get_pub
+	case "$st" in
+	sim) head='📶 <b>Switched to mobile data</b>'
+	     [ -n "$ago" ] && note="ISP had been up $ago" ;;
+	isp) head='🔌 <b>Back on the wired uplink</b>'
+	     [ -n "$ago" ] && note="SIM held $ago" ;;
+	*)   head="<b>Uplink → $(esc "$st")</b>" ;;
+	esac
+
+	printf '%s\n' "$head"
+	if [ -n "$note" ]; then printf '%s · %s\n' "$(esc "$why")" "$note"
+	else printf '%s\n' "$(esc "$why")"; fi
+	printf '\n'
+	if [ "$st" = sim ]; then
+		if [ "$mip" != "-" ] && [ -n "$mip" ]; then
+			printf 'SIM  <code>%s</code>  modem link\n' "$(esc "$mip")"
+		else
+			printf 'SIM  <i>no address yet</i>\n'
+		fi
+		if [ -n "$PUB" ]; then
+			printf 'WAN  <code>%s</code>  public' "$(esc "$PUB")"
+			[ -n "$PUB_LOC" ] && printf ' · %s' "$(esc "$PUB_LOC")"
+			printf '\n'
+		fi
+	else
+		if [ "$wip" != "-" ] && [ -n "$wip" ]; then
+			printf 'WAN  <code>%s</code>  public' "$(esc "$wip")"
+		else
+			printf 'WAN  <i>no address</i>'
+		fi
+		[ -n "$PUB_LOC" ] && printf ' · %s' "$(esc "$PUB_LOC")"
+		printf '\n'
+		[ "$mip" != "-" ] && [ -n "$mip" ] && printf 'SIM  <i>parked</i>\n'
+	fi
+	printf '\n%s UTC\n' "$clock"
 }
 
-compose_hb() {
-	local st since pub
-	st=$(sval state); since=$(sval since); pub=$(pub_ip)
+compose_hb() { # daily "still alive" line
+	local st since ago clock pe
+	st=$(sval state); since=$(sval since)
 	[ -n "$st" ] || st=unknown
-	[ -n "$since" ] || since=-
-	printf '✅ Router alive · uplink %s\nsince %s · %s' \
-		"$(echo "$st" | tr 'a-z' 'A-Z')" "$since" "$(now)"
-	[ -n "$pub" ] && printf ' · public %s' "$pub"
+	pe=$(epoch_of "$since")
+	[ -n "$pe" ] && ago=$(dur $(( $(date +%s) - pe )))
+	clock=$(date -u +%H:%M:%S)
+	get_pub
+	printf '<b>✅ Router alive</b>\n'
+	printf 'Uplink %s' "$(echo "$st" | tr 'a-z' 'A-Z')"
+	[ -n "$ago" ] && printf ' · up %s' "$ago"
+	printf '\n\n'
+	if [ "$st" = sim ]; then
+		[ -n "$PUB" ] && printf 'WAN  <code>%s</code>  public\n' "$(esc "$PUB")"
+		printf 'SIM  <code>%s</code>  modem link\n' "$(esc "$(sval modem_ip)")"
+	else
+		printf 'WAN  <code>%s</code>  public' "$(esc "$(sval wan_ip)")"
+		[ -n "$PUB_LOC" ] && printf ' · %s' "$(esc "$PUB_LOC")"
+		printf '\n'
+	fi
+	printf '\n%s UTC\n' "$clock"
 }
 
 # A flapping ISP can switch every 30 s; keep at most one message per MUTE
@@ -165,11 +236,15 @@ fi
 case "$1" in
 sim|isp)
 	# wan-failover calls this the instant the route changes; give it a moment
-	# to write the fresh status file, then report.
+	# to write the fresh status file, then report. $3 is the ISO start of the
+	# state being left, so the message can say how long it lasted.
 	sleep 2
 	may_send "$1" || exit 0
-	msg=$(compose "$1" "${2:-manual}")
-	[ "${SUPP:-0}" -gt 0 ] && msg="$msg (+$SUPP suppressed)"
+	msg=$(compose "$1" "${2:-manual}" "$3")
+	if [ "${SUPP:-0}" -gt 0 ]; then
+		msg="$msg<i>+$SUPP earlier switch(es) held back by the cooldown</i>
+"
+	fi
 	send_retry "$msg" && mark_sent "$1"
 	;;
 init)
@@ -183,19 +258,24 @@ init)
 	fi
 	[ "$SENT_ST" = "$2" ] && { log "init $2 already reported — silent"; exit 0; }
 	sleep 2
-	send_retry "$(compose "$2" "${3:-watchdog restart}")" && mark_sent "$2"
+	send_retry "$(compose "$2" "${3:-watchdog restart}" "$4")" && mark_sent "$2"
 	;;
 heartbeat)
 	[ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || exit 0
 	send_retry "$(compose_hb)"
 	;;
 test)
+	# Renders the real layout for the current uplink; "test sim|isp" previews
+	# the other branch, and an optional ISO timestamp shows the duration line.
+	# Never touches the cooldown state.
 	[ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || {
 		echo "set TG_TOKEN and TG_CHAT in $CONF first" >&2; exit 1; }
-	f=$(cfgfile "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-		"chat_id=$(echo "$TG_CHAT" | cut -d, -f1)" "text=wan-notify test")
-	curl -4 -sS -m 10 --config "$f"; echo
-	rm -f "$f"
+	st=${2:-$(sval state)}
+	case "$st" in sim|isp) ;; *) st=isp ;; esac
+	msg=$(compose "$st" "test message — no switch happened" "${3:-}")
+	printf '%s\n' "$msg"
+	printf '%s\n' "--- sending ---"
+	tg "$msg" && { log "test sent"; echo "delivered"; } || exit 1
 	;;
 chatid)
 	[ -n "$TG_TOKEN" ] || { echo "set TG_TOKEN in $CONF first" >&2; exit 1; }
@@ -221,7 +301,7 @@ status)
 	[ -s "$LOG" ] && { echo "--- recent ---"; tail -5 "$LOG"; }
 	;;
 *)
-	echo "usage: $0 sim|isp <reason> | heartbeat | test | chatid | status" >&2
+	echo "usage: $0 sim|isp <reason> [prev_since] | init <state> [reason] | heartbeat | test [sim|isp] | chatid | status" >&2
 	exit 1
 	;;
 esac

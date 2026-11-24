@@ -222,6 +222,7 @@
 	var lastSample = null;
 	var hero = null;
 	var uplinks = null;
+	var thermal = null;
 	var timer = null;
 
 	function heroMarkup() {
@@ -280,8 +281,112 @@
 		'</div>';
 	}
 
-	function uplinkMarkup() {
+	/* ------------------------------------------------------------- thermals */
+
+	var THERMAL_GROUPS = [
+		{ key: 'cpu', label: 'CPU cluster', test: /^cpu_little/ },
+		{ key: 'gpu', label: 'GPU', test: /^gpu/ },
+		{ key: 'pmic', label: 'PMIC rails', test: /^pmic/ },
+		{ key: 'modem', label: 'Modem / RF', test: /^(md_|nrpa|ltepa|rf_ntc)/ },
+		{ key: 'dram', label: 'DRAM', test: /dram/ }
+	];
+
+	function tempBand(c) {
+		if (c >= 85) return 'critical';
+		if (c >= 70) return 'hot';
+		if (c >= 55) return 'warm';
+		return 'cool';
+	}
+
+	function tempBandLabel(c) {
+		return { critical: 'Critical', hot: 'Hot', warm: 'Warm', cool: 'Cool' }[tempBand(c)];
+	}
+
+	/* 25-95 C mapped onto the gauge; clamped so the pin stays inside it. */
+	function tempPos(c) {
+		var p = ((c - 25) / 70) * 100;
+		return Math.max(1.5, Math.min(100, p));
+	}
+
+	function shortSensor(n) {
+		return n
+			.replace(/^cpu_little(\d)$/, 'CPU$1')
+			.replace(/^soc_max$/, 'soc')
+			.replace(/^md_5g$/, '5G').replace(/^md_4g$/, '4G').replace(/^md_3g$/, '3G')
+			.replace(/^md_rf$/, 'RF').replace(/_ntc$/, '').replace(/_/g, ' ');
+	}
+
+	function thermalMarkup() {
 		return '' +
+		'<div class="thermal-head">' +
+			'<span class="thermal-title">Thermals</span>' +
+			'<span class="thermal-note" data-k="thermal-note">—</span>' +
+		'</div>' +
+		'<div class="thermal-body">' +
+			'<div class="thermal-main">' +
+				'<div class="thermal-now">' +
+					'<span class="thermal-value mono" data-k="thermal-max">—</span>' +
+					'<span class="thermal-unit">°C</span>' +
+				'</div>' +
+				'<div class="thermal-band" data-k="thermal-band">—</div>' +
+				'<div class="thermal-gauge"><span class="thermal-gauge-pin" data-k="thermal-pin"></span></div>' +
+				'<div class="thermal-scale"><span>25</span><span>55</span><span>75</span><span>95</span></div>' +
+				'<div class="thermal-sub" data-k="thermal-sub">SoC hotspot</div>' +
+			'</div>' +
+			'<div class="thermal-groups" data-k="thermal-groups"></div>' +
+		'</div>' +
+		'<div class="thermal-chips" data-k="thermal-chips"></div>';
+	}
+
+	function renderThermals(data) {
+		var t = data && data.thermal;
+		if (!thermal || !t) return;
+		var list = asArray(t.sensors);
+		if (!list.length) { thermal.classList.add('is-empty'); return; }
+
+		var max = (+t.max || 0) / 10; /* tenths from the router */
+		thermal.setAttribute('data-band', tempBand(max));
+
+		var el = $('[data-k="thermal-max"]', thermal);
+		if (el) el.textContent = max.toFixed(1);
+		el = $('[data-k="thermal-band"]', thermal);
+		if (el) el.textContent = tempBandLabel(max);
+		el = $('[data-k="thermal-note"]', thermal);
+		if (el) {
+			el.textContent = list.length + ' sensors · '
+				+ (t.cooling ? t.cooling + ' throttling' : 'no throttling');
+		}
+		el = $('[data-k="thermal-pin"]', thermal);
+		if (el) el.style.left = tempPos(max).toFixed(1) + '%';
+
+		var groups = $('[data-k="thermal-groups"]', thermal);
+		if (groups) {
+			var html = '';
+			THERMAL_GROUPS.forEach(function (g) {
+				var vals = list.filter(function (s) { return g.test.test(s.name); })
+					.map(function (s) { return +s.c / 10; });
+				if (!vals.length) return;
+				var hot = Math.max.apply(Math, vals);
+				html += '<div class="thermal-row" data-band="' + tempBand(hot) + '">' +
+					'<span class="thermal-row-label">' + g.label + '</span>' +
+					'<span class="thermal-row-bar"><i style="width:' + tempPos(hot).toFixed(1) + '%"></i></span>' +
+					'<span class="thermal-row-val mono">' + hot.toFixed(1) + '°</span>' +
+					'</div>';
+			});
+			groups.innerHTML = html;
+		}
+
+		var chips = $('[data-k="thermal-chips"]', thermal);
+		if (chips) {
+			chips.innerHTML = list.map(function (s) {
+				var c = (+s.c) / 10;
+				return '<span class="thermal-chip" data-band="' + tempBand(c) + '" title="' + s.name + '">' +
+					shortSensor(s.name) + ' <b>' + c.toFixed(1) + '</b></span>';
+			}).join('');
+		}
+	}
+
+	function uplinkMarkup() {		return '' +
 		'<div class="uplinks-head">' +
 			'<span class="uplinks-title">WAN interfaces</span>' +
 			'<span class="uplinks-note" data-k="uplinks-note">—</span>' +
@@ -331,6 +436,13 @@
 		uplinks.innerHTML = uplinkMarkup();
 		if (hero.nextSibling) view.insertBefore(uplinks, hero.nextSibling);
 		else view.appendChild(uplinks);
+
+		thermal = doc.createElement('section');
+		thermal.id = 'console-thermals';
+		thermal.className = 'thermal';
+		thermal.innerHTML = thermalMarkup();
+		if (uplinks.nextSibling) view.insertBefore(thermal, uplinks.nextSibling);
+		else view.appendChild(thermal);
 
 		$$('.hstat', hero).forEach(function (a) {
 			var u = a.getAttribute('data-href');
@@ -502,6 +614,7 @@
 
 		heroState(up ? 'up' : 'down');
 		renderUplinks(data);
+		renderThermals(data);
 
 		var dot = $('.hero-eyebrow .dot', hero);
 		if (dot) dot.className = 'dot ' + (up ? 'dot-ok' : 'dot-danger');
@@ -553,6 +666,16 @@
 		var load = (data.load && data.load[0] != null) ? data.load[0] : '—';
 		heroSet('cpu', cpu.usage != null ? cpu.usage + '%' : '—');
 		heroSet('cpu-foot', 'mem ' + (pct != null ? pct + '%' : '—') + ' · load ' + load);
+		/* The SoC temperature lives in the Thermals card, but the tile is where
+		   a glance lands first, so surface it as a tooltip. */
+		var cpuTile = $('[data-k="cpu"]', hero);
+		if (cpuTile && cpuTile.parentNode && data.thermal && data.thermal.max) {
+			cpuTile.parentNode.setAttribute('title',
+				'CPU ' + (cpu.usage != null ? cpu.usage + '%' : '—')
+				+ ' · memory ' + (pct != null ? pct + '%' : '—')
+				+ ' · load ' + load
+				+ ' · SoC ' + (data.thermal.max / 10).toFixed(1) + '°C');
+		}
 
 		sample(data);
 	}
