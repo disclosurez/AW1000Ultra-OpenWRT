@@ -287,6 +287,33 @@ if [ "${WITH_WANFAILOVER:-1}" = 1 ]; then
 	[ -f /etc/wan-notify.conf ] || put "$SRC/system/wan-notify.conf" /etc/wan-notify.conf 0600
 	cron_add '0 9 * * * /usr/sbin/wan-notify heartbeat >/dev/null 2>&1'
 
+	log "notifications (Telegram / Discord)"
+	put "$SRC/system/sbin/wan-notify" /usr/sbin/wan-notify 0755
+	put "$SRC/luci/controller/notify.lua" /usr/lib/lua/luci/controller/notify.lua 0644
+	put "$SRC/luci/view/notify.htm" /usr/lib/lua/luci/view/notify.htm 0644
+	put "$SRC/luci/menu.d/aw1000-notify.json" /usr/share/luci/menu.d/aw1000-notify.json 0644
+	seed notify "$SRC/uci/notify"
+	# one-time migration from the shell config the first version used
+	if [ -f /etc/wan-notify.conf ]; then
+		if [ ! -s /etc/notify.telegram.token ]; then
+			t=$(sed -n "s/^TG_TOKEN='\(.*\)'/\1/p" /etc/wan-notify.conf)
+			if [ -n "$t" ]; then
+				printf '%s\n' "$t" > /etc/notify.telegram.token
+				chmod 600 /etc/notify.telegram.token
+			fi
+		fi
+		c=$(sed -n "s/^TG_CHAT='\(.*\)'/\1/p" /etc/wan-notify.conf)
+		if [ -n "$c" ] && [ -z "$(uci -q get notify.settings.chat)" ]; then
+			uci set notify.settings.chat="$c"
+			uci commit notify
+		fi
+		m=$(sed -n "s/^MUTE=\([0-9]*\)/\1/p" /etc/wan-notify.conf)
+		if [ -n "$m" ]; then
+			uci set notify.settings.mute="$m"
+			uci commit notify
+		fi
+	fi
+
 	log "throughput measurements"
 	put "$SRC/system/sbin/netspeed" /usr/sbin/netspeed 0755
 	put "$SRC/luci/controller/netspeed.lua" /usr/lib/lua/luci/controller/netspeed.lua 0644

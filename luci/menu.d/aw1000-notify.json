@@ -1,0 +1,10 @@
+{
+	"admin/system/notifications": {
+		"title": "Notifications",
+		"order": 55,
+		"action": {
+			"type": "template",
+			"path": "notify"
+		}
+	}
+}

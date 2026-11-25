@@ -195,50 +195,58 @@ ifstatus wan | grep '"up"'                     # false — SIM torn down
 `./test-wanfailover2.sh` runs that drill end to end and prints the SIM state at
 each step.
 
-### 1d. Uplink switch notifications (Telegram)
+### 1d. Uplink switch notifications (Telegram / Discord)
 
 The watchdog pings the phone when it actually switches, so a silent ISP outage
-does not go unnoticed.
+does not go unnoticed. Configured in **System → Notifications**.
 
 | File | Role |
 |---|---|
-| `/usr/sbin/wan-notify` | `sim\|isp <reason>` · `init` · `heartbeat` · `test` · `chatid` · `status` |
-| `/etc/wan-notify.conf` | `TG_TOKEN`, `TG_CHAT` (comma-separated ok), `MUTE` — mode **600** |
+| `/etc/config/notify` | `enabled`, `provider` (telegram/discord/both), `chat`, `mute`, `on_switch`, `on_heartbeat`, the two `*_file` paths |
+| `/etc/notify.telegram.token` | bot token, mode **600** |
+| `/etc/notify.discord.webhook` | webhook URL, mode **600** |
+| `/usr/sbin/wan-notify` | `sim\|isp` · `init` · `heartbeat` · `test` · `chatid` · `status` |
+| `luci/controller/notify.lua` + `luci/view/notify.htm` | the page (`admin/system/notifications`), save + test actions |
 | `/usr/sbin/wan-failover` | `notify()` after each state transition (detached; never blocks the probe loop) |
 | cron | `0 9 * * * wan-notify heartbeat` — dead-man's switch: no message = no router |
-| log | `logger -t wan-notify`, `/tmp/wan-notify.log` (capped 64 KB) |
+| log | `logger -t wan-notify`, `/tmp/wan-notify.log` (capped 64 KB, shown on the page) |
 
 - Sends only on a real transition (the loop already debounces with
   `FAIL_TRIES`/`OK_TRIES`). A boot is silent (no state file in `/tmp`), but a
   watchdog **restart** that leaves the uplink somewhere other than the last
-  reported state does send — otherwise the last alert keeps lying (e.g. a
-  manual `ifup isp` flips to SIM, then the restart returns to ISP silently).
+  reported state does send — otherwise the last alert keeps lying.
 - The message names the SIM link address, the ISP address, and the **public
   egress** — the carrier's NAT address is not an interface address, so it is
   asked from `cloudflare.com/cdn-cgi/trace` at send time and simply omitted if
   that lookup fails.
-- It goes out over whichever uplink just came up, so a switch *to* the SIM is
-  reported over the SIM (and carries the carrier's address).
+- Telegram gets HTML (`parse_mode=HTML`); Discord gets the same message
+  converted to markdown (`<b>`→`**`, `<code>`→`` ` ``) and posted as
+  `{"username":"Router","content":…}`. A failing provider does not stop the
+  other.
 - `MUTE` (default 300 s) keeps a flapping ISP from pinging every cycle; held-back
   switches are counted and appended to the next message (`+3 suppressed`).
-- Delivery retries 3× at 5 s, `-4` + 10 s timeout, because DNS can be stale for a
-  second or two right after the route changes.
-- The token is **never** in `argv`: `curl` runs from a 0600 `--config` file that
-  is deleted immediately.
-- Empty token/chat = silent no-op (logged once), so the watchdog is safe before
-  setup.
+- Delivery retries 3× at 5 s, `-4` + 10 s timeout, because DNS can be stale for
+  a second or two right after the route changes.
+- Secrets are **never** in `argv`: Telegram uses a 0600 `--config` file, Discord
+  posts a 0600 JSON payload file via `data-binary = @…`. Both are deleted
+  immediately.
+- Empty token/chat = silent no-op (logged once). A legacy `/etc/wan-notify.conf`
+  is still read when `/etc/config/notify` is absent, so an upgrade keeps
+  working.
 
 ```bash
 /usr/sbin/wan-notify status
 /usr/sbin/wan-notify chatid     # ids that have written to the bot
-/usr/sbin/wan-notify test
+/usr/sbin/wan-notify test       # one attempt, prints the composed message
 /usr/sbin/wan-notify heartbeat
 tail -5 /tmp/wan-notify.log
 ```
 
-Getting the token: Telegram → **@BotFather** → `/newbot` → name + username
-ending in `bot` → paste the token into `TG_TOKEN`; open the bot, press START,
-send anything, then run `wan-notify chatid` and put that in `TG_CHAT`.
+Getting a Telegram token: **@BotFather** → `/newbot` → name + username ending
+in `bot`. Open the bot, press START, send anything, then
+`wan-notify chatid`. Discord: Channel → **Edit Channel** → Integrations →
+Webhooks → New Webhook → Copy URL. `system/hook-test.lua` is a throwaway Lua
+listener used to verify the Discord payload shape without a real webhook.
 
 ### 1e. Throughput measurements (speedtest.net)
 
@@ -1316,6 +1324,19 @@ probe-*.sh, test-*.sh                                                     ad-hoc
 ```
 
 ## Changelog
+- **2026-11-25** — **System → Notifications, and Discord.** The Telegram-only
+  `wan-notify` is now configurable in LuCI: **System → Notifications** edits
+  `/etc/config/notify` (provider, chat id, cooldown, which events) and writes
+  the two credentials to their own 0600 files (`/etc/notify.telegram.token`,
+  `/etc/notify.discord.webhook`) — blank fields keep the stored secret, a
+  checkbox removes it. A **Send test message** button posts once and prints the
+  composed message plus the result; the last 15 send/suppress/failure lines
+  from `/tmp/wan-notify.log` are on the page. Delivery now supports **Discord
+  webhooks** alongside Telegram: the HTML message is converted to markdown and
+  posted as `{"username":"Router","content":…}` from a 0600 payload file, and a
+  failed provider does not block the other. The legacy `/etc/wan-notify.conf`
+  is migrated by the installer and still read if UCI is missing.
+
 - **2026-11-24** — **fast.com engine, and an honest label for the numbers.**
   `netspeed` gained a second engine: `fast` (default) asks fast.com for Netflix
   OCA targets and loops ~528 kB chunks over 4 connections for 6 s — 6.4 s and

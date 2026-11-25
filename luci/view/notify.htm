@@ -1,0 +1,200 @@
+<%+header%>
+<%
+local uci  = require "luci.model.uci".cursor()
+local fs   = require "nixio.fs"
+local util = require "luci.util"
+local pcdata = util.pcdata
+
+local function get(opt, default)
+	local v = uci:get("notify", "settings", opt)
+	if v == nil or v == "" then return default end
+	return v
+end
+
+local enabled  = get("enabled", "1")
+local provider = get("provider", "telegram")
+local chat     = get("chat", "")
+local mute     = get("mute", "300")
+local on_switch = get("on_switch", "1")
+local on_hb    = get("on_heartbeat", "1")
+
+local TG_FILE = get("telegram_token_file", "/etc/notify.telegram.token")
+local DC_FILE = get("discord_webhook_file", "/etc/notify.discord.webhook")
+
+local function has_secret(p)
+	local s = fs.stat(p)
+	return s ~= nil and s.size > 0
+end
+
+local tg_set = has_secret(TG_FILE)
+local dc_set = has_secret(DC_FILE)
+
+local function sel(v, want)
+	return (v == want) and " selected" or ""
+end
+
+local q = function(k) return (luci.http.formvalue(k) ~= nil) end
+local notice = ""
+if q("saved") then notice = "Saved."
+elseif q("tested") then notice = "Test sent — check the log below."
+elseif q("token-rejected") then notice = "Saved, but the Telegram token did not look like <code>123456:AA…</code> and was not stored."
+elseif q("webhook-rejected") then notice = "Saved, but the Discord webhook must be an https:// URL and was not stored."
+end
+%>
+
+<h2 name="content"><%:Notifications%></h2>
+
+<p class="cbi-section-description" style="margin:0 0 16px">
+	Push a message to your phone when the uplink switches between ISP and SIM.
+	Delivery uses a <b>Telegram bot</b>, a <b>Discord webhook</b>, or both.
+	Credentials are stored in 0600 files and never shown again.
+</p>
+
+<% if notice ~= "" then %>
+<div class="alert-message" style="margin-bottom:16px"><%=notice%></div>
+<% end %>
+
+<form method="post" action="<%=url('admin/system/notifications/save')%>" class="cbi-map">
+<input type="hidden" name="token" value="<%=token%>" />
+
+<div class="cbi-section">
+	<h3><%:Delivery%></h3>
+	<div class="cbi-section-node">
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Enabled%></label>
+			<div class="cbi-value-field">
+				<input type="checkbox" name="enabled" value="1" <%= (enabled == "1") and "checked" or "" %> />
+				<div class="cbi-value-description">
+					Off silences switch alerts and the daily heartbeat. A test message still sends.
+				</div>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Provider%></label>
+			<div class="cbi-value-field">
+				<select class="cbi-input-select" name="provider">
+					<option value="telegram"<%=sel(provider, "telegram")%>>Telegram</option>
+					<option value="discord"<%=sel(provider, "discord")%>>Discord webhook</option>
+					<option value="both"<%=sel(provider, "both")%>>Both</option>
+				</select>
+				<div class="cbi-value-description">
+					With <b>Both</b>, a failed Telegram send does not stop the Discord one.
+				</div>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Telegram token%></label>
+			<div class="cbi-value-field">
+				<input type="password" class="cbi-input-text" name="telegram_token" autocomplete="new-password"
+					placeholder="<%= tg_set and 'stored — leave blank to keep' or '123456789:AAH…' %>" />
+				<% if tg_set then %>
+				<label style="display:block;margin-top:6px;font-size:12px">
+					<input type="checkbox" name="telegram_token_clear" value="1" /> <%:Remove the stored token%>
+				</label>
+				<% end %>
+				<div class="cbi-value-description">
+					From <b>@BotFather</b> → <code>/newbot</code>. Open the bot once and press START,
+					otherwise Telegram refuses to deliver to it.
+				</div>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Telegram chat id%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="chat" value="<%=pcdata(chat)%>"
+					placeholder="5905082628  or  -1001234567890" />
+				<div class="cbi-value-description">
+					Several ids may be comma separated. Groups have a negative id.
+					Use <code>wan-notify chatid</code> over SSH to discover it.
+				</div>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Discord webhook%></label>
+			<div class="cbi-value-field">
+				<input type="password" class="cbi-input-text" name="discord_webhook" autocomplete="new-password"
+					placeholder="<%= dc_set and 'stored — leave blank to keep' or 'https://discord.com/api/webhooks/…' %>" />
+				<% if dc_set then %>
+				<label style="display:block;margin-top:6px;font-size:12px">
+					<input type="checkbox" name="discord_webhook_clear" value="1" /> <%:Remove the stored webhook%>
+				</label>
+				<% end %>
+				<div class="cbi-value-description">
+					Channel → <b>Edit Channel</b> → Integrations → Webhooks → New Webhook → Copy URL.
+					Anyone with that URL can post to the channel.
+				</div>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Cooldown%></label>
+			<div class="cbi-value-field">
+				<input type="text" class="cbi-input-text" name="mute" value="<%=pcdata(mute)%>" size="6" />
+				<span style="margin-left:8px">seconds</span>
+				<div class="cbi-value-description">
+					Minimum gap between switch alerts. A flapping ISP is otherwise a stream
+					of messages; suppressed switches are counted into the next one.
+				</div>
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Events%></label>
+			<div class="cbi-value-field">
+				<label style="display:block;margin-bottom:4px">
+					<input type="checkbox" name="on_switch" value="1" <%= (on_switch == "1") and "checked" or "" %> />
+					<b>Uplink switches</b> — ISP ⇄ SIM, with both addresses and the public egress
+				</label>
+				<label style="display:block">
+					<input type="checkbox" name="on_heartbeat" value="1" <%= (on_hb == "1") and "checked" or "" %> />
+					<b>Daily heartbeat</b> — 09:00 UTC; if it stops arriving, the router is down
+				</label>
+			</div>
+		</div>
+
+	</div>
+</div>
+
+<div class="cbi-page-actions">
+	<button type="submit" class="cbi-button cbi-button-save"><%:Save%></button>
+	<button type="submit" class="cbi-button cbi-button-apply"
+		formaction="<%=url('admin/system/notifications/test')%>"><%:Send test message%></button>
+</div>
+</form>
+
+<div class="cbi-section">
+	<h3><%:Recent deliveries%></h3>
+	<div class="cbi-section-node">
+<%
+local logpath = "/tmp/wan-notify.log"
+local lines = {}
+local fh = io.open(logpath, "r")
+if fh then
+	for l in fh:lines() do lines[#lines + 1] = l end
+	fh:close()
+end
+local from = math.max(1, #lines - 14)
+%>
+		<div class="cbi-value-description" style="margin-bottom:8px">
+			Send, suppress and failure lines from <code><%=logpath%></code> (RAM, lost on reboot).
+			The messages themselves stay in Telegram / Discord.
+		</div>
+		<pre class="cbi-code" style="max-height:260px;overflow:auto;margin:0"><%
+if #lines == 0 then
+	%><%:Nothing sent since the last boot.%><%
+else
+	for i = from, #lines do
+		%><%=pcdata(lines[i])%>
+<%
+	end
+end
+%></pre>
+	</div>
+</div>
+
+<%+footer%>

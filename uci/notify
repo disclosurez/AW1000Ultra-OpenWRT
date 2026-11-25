@@ -1,0 +1,25 @@
+# Seed for /etc/config/notify — written only if the file does not exist.
+# Edited by System -> Notifications; read by /usr/sbin/wan-notify.
+#
+# Secrets are NOT stored here. They live in their own 0600 files:
+#   /etc/notify.telegram.token    bot token from @BotFather
+#   /etc/notify.discord.webhook   channel webhook URL
+
+config settings 'settings'
+	option enabled '1'
+
+	# telegram | discord | both
+	option provider 'telegram'
+
+	# Telegram chat id(s), comma separated. Groups have a negative id.
+	option chat ''
+
+	# Minimum seconds between switch alerts (flapping protection).
+	option mute '300'
+
+	# Which events are sent at all.
+	option on_switch '1'
+	option on_heartbeat '1'
+
+	option telegram_token_file '/etc/notify.telegram.token'
+	option discord_webhook_file '/etc/notify.discord.webhook'

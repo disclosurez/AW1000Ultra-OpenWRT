@@ -1,26 +1,26 @@
 #!/bin/sh
-# wan-notify — ping the phone when the uplink switches (Telegram bot).
+# wan-notify — alert the phone when the uplink switches (Telegram / Discord).
 #
-#   wan-notify sim|isp <reason>   send a switch notice (called by wan-failover)
-#   wan-notify heartbeat          daily "still alive" message (missing = alarm)
-#   wan-notify test               send a test message, print the API reply
-#   wan-notify chatid             print chat ids that have written to the bot
-#   wan-notify status             show config + cooldown state
+#   wan-notify sim|isp <reason> [previous_since]
+#   wan-notify init <state> [reason] [previous_since]
+#   wan-notify heartbeat
+#   wan-notify test [sim|isp]
+#   wan-notify chatid
+#   wan-notify status
 #
-# Config: /etc/wan-notify.conf (0600).  The bot token is never passed in argv:
-# curl is driven from a 0600 --config file that is deleted immediately.
+# Configuration is UCI (/etc/config/notify, edited in System -> Notifications).
+# Credentials live in their own 0600 files and are never passed in argv:
+#   telegram_token_file   bot token
+#   discord_webhook_file  webhook URL
+#
+# A legacy /etc/wan-notify.conf is still honoured when /etc/config/notify is
+# absent, so an upgrade from the first version keeps working.
 
-CONF=/etc/wan-notify.conf
 TAG=wan-notify
+LEGACY=/etc/wan-notify.conf
 STATUS=/tmp/wanfailover.status
 STATE_FILE=/tmp/wan-notify.last
 LOG=/tmp/wan-notify.log
-
-# shellcheck disable=SC1090
-[ -r "$CONF" ] && . "$CONF"
-TG_TOKEN=${TG_TOKEN:-}
-TG_CHAT=${TG_CHAT:-}
-MUTE=${MUTE:-300}
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -34,7 +34,55 @@ log() {
 
 sval() { sed -n "s/^$1=//p" "$STATUS" 2>/dev/null; }
 
-cfgfile() { # cfgfile <url> [data ...]  -> path (0600, caller removes)
+load_conf() {
+	if [ -f /etc/config/notify ]; then
+		PROVIDER=$(uci -q get notify.settings.provider)
+		TG_CHAT=$(uci -q get notify.settings.chat)
+		MUTE=$(uci -q get notify.settings.mute)
+		ON_SWITCH=$(uci -q get notify.settings.on_switch)
+		ON_HB=$(uci -q get notify.settings.on_heartbeat)
+		ENABLED=$(uci -q get notify.settings.enabled)
+		TG_FILE=$(uci -q get notify.settings.telegram_token_file)
+		DC_FILE=$(uci -q get notify.settings.discord_webhook_file)
+	else
+		ENABLED=1
+		PROVIDER=telegram
+		ON_SWITCH=1
+		ON_HB=1
+		TG_FILE=
+		DC_FILE=
+		# shellcheck disable=SC1090
+		[ -r "$LEGACY" ] && . "$LEGACY"
+	fi
+
+	[ -n "$PROVIDER" ] || PROVIDER=telegram
+	[ -n "$MUTE" ] || MUTE=300
+	[ -n "$TG_FILE" ] || TG_FILE=/etc/notify.telegram.token
+	[ -n "$DC_FILE" ] || DC_FILE=/etc/notify.discord.webhook
+
+	# a UCI install with no telegram token file falls back to the legacy value
+	if [ -r "$TG_FILE" ]; then
+		TG_TOKEN=$(tr -d ' \r\n\t' < "$TG_FILE" 2>/dev/null)
+	fi
+	[ -n "$TG_TOKEN" ] || TG_TOKEN=${TG_TOKEN:-}
+	if [ -r "$DC_FILE" ]; then
+		DC_WEBHOOK=$(tr -d ' \r\n' < "$DC_FILE" 2>/dev/null)
+	fi
+	[ -n "$DC_WEBHOOK" ] || DC_WEBHOOK=${DC_WEBHOOK:-}
+}
+
+# Provider gate: selected in the UI *and* actually configured.
+have_tg() {
+	case "$PROVIDER" in telegram|both) ;; *) return 1 ;; esac
+	[ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]
+}
+
+have_dc() {
+	case "$PROVIDER" in discord|both) ;; *) return 1 ;; esac
+	[ -n "$DC_WEBHOOK" ]
+}
+
+cfgfile() { # cfgfile <url> [data ...] -> path (0600, caller removes)
 	local f
 	f=$(mktemp /tmp/wan-notify.XXXXXX) || return 1
 	chmod 600 "$f"
@@ -47,7 +95,13 @@ cfgfile() { # cfgfile <url> [data ...]  -> path (0600, caller removes)
 	echo "$f"
 }
 
-tg_one() { # tg_one <chat_id> <encoded html text> -> 0 on HTTP 200
+to_md() { # the composed messages are HTML; Discord wants markdown
+	sed -e 's|<b>|**|g' -e 's|</b>|**|g' \
+	    -e 's|<i>|_|g'  -e 's|</i>|_|g' \
+	    -e 's|<code>|`|g' -e 's|</code>|`|g'
+}
+
+tg_one() { # tg_one <chat_id> <encoded html> -> 0 on HTTP 200
 	local f code resp rc
 	resp=/tmp/wan-notify.reply
 	f=$(mktemp /tmp/wan-notify.XXXXXX) || return 1
@@ -62,13 +116,13 @@ tg_one() { # tg_one <chat_id> <encoded html text> -> 0 on HTTP 200
 	code=$(curl -4 -s -m 10 -o "$resp" -w '%{http_code}' --config "$f" 2>/dev/null)
 	rc=$?
 	rm -f "$f"
-	[ "$rc" = 0 ] || { log "curl failed (rc=$rc)"; return 1; }
+	[ "$rc" = 0 ] || { log "telegram curl failed (rc=$rc)"; return 1; }
 	[ "$code" = 200 ] && return 0
 	log "telegram HTTP $code: $(head -c 200 "$resp" 2>/dev/null)"
 	return 1
 }
 
-tg() { # tg <text> -> 0 if every configured chat got it
+tg() { # tg <html text> -> 0 if every configured chat got it
 	local text ids id rc=0
 	# a newline inside a curl --config value breaks the parser: send %0A
 	text=$(printf '%s\n' "$1" | awk 'BEGIN{ORS=""} NR>1{printf "%%0A"} {print}' \
@@ -80,10 +134,52 @@ tg() { # tg <text> -> 0 if every configured chat got it
 	return $rc
 }
 
-send_retry() { # send_retry <text>
+discord_send() { # discord_send <markdown text> -> 0 on 200/204
+	local f code resp rc
+	resp=/tmp/wan-notify.reply
+	# JSON payload written to a file: no quoting games in the curl config
+	printf '%s\n' "$1" | awk '
+		BEGIN { printf "{\"username\":\"Router\",\"content\":\"" }
+		{
+			gsub(/\\/, "\\\\"); gsub(/"/, "\\\"")
+			if (NR > 1) printf "\\n"
+			printf "%s", $0
+		}
+		END { printf "\"}" }' > /tmp/notify.payload
+
+	f=$(mktemp /tmp/wan-notify.XXXXXX) || return 1
+	chmod 600 "$f"
+	{
+		printf 'url = "%s"\n' "$DC_WEBHOOK"
+		printf 'header = "Content-Type: application/json"\n'
+		printf 'data-binary = "@/tmp/notify.payload"\n'
+	} > "$f"
+	code=$(curl -4 -s -m 10 -o "$resp" -w '%{http_code}' --config "$f" 2>/dev/null)
+	rc=$?
+	rm -f "$f" /tmp/notify.payload
+	[ "$rc" = 0 ] || { log "discord curl failed (rc=$rc)"; return 1; }
+	case "$code" in
+	200|204) return 0 ;;
+	esac
+	log "discord HTTP $code: $(head -c 200 "$resp" 2>/dev/null)"
+	return 1
+}
+
+send_once() { # send_once <html text> -> 0 if every enabled provider took it
+	local rc=0
+	if have_tg; then tg "$1" || rc=1; fi
+	if have_dc; then discord_send "$(printf '%s\n' "$1" | to_md)" || rc=1; fi
+	if ! have_tg && ! have_dc; then
+		log "no provider configured (provider=$PROVIDER, token=$([ -n "$TG_TOKEN" ] && echo yes || echo no), webhook=$([ -n "$DC_WEBHOOK" ] && echo yes || echo no))"
+		return 2
+	fi
+	return $rc
+}
+
+send_retry() {
 	local i=1
 	while [ "$i" -le 3 ]; do
-		tg "$1" && { log "sent"; return 0; }
+		send_once "$1" && { log "sent"; return 0; }
 		[ "$i" -lt 3 ] && sleep 5
 		i=$((i + 1))
 	done
@@ -91,7 +187,7 @@ send_retry() { # send_retry <text>
 	return 1
 }
 
-dur() { # dur <seconds> -> "4h 31m" / "6m 12s" / "45s"
+dur() { # seconds -> "4h 31m" / "6m 12s" / "45s"
 	local s=${1:-0} d h m
 	case "$s" in ''|*[!0-9]*) return 0 ;; esac
 	[ "$s" -gt 0 ] || { echo "0s"; return 0; }
@@ -103,7 +199,7 @@ dur() { # dur <seconds> -> "4h 31m" / "6m 12s" / "45s"
 	fi
 }
 
-epoch_of() { # epoch_of <ISO8601Z> -> epoch (empty if unusable)
+epoch_of() { # <ISO8601Z> -> epoch
 	case "$1" in ''|'-') return 0 ;; esac
 	date -u -D '%Y-%m-%dT%H:%M:%SZ' -d "$1" +%s 2>/dev/null
 }
@@ -120,7 +216,7 @@ get_pub() { # sets PUB (+ PUB_LOC); silent when the lookup fails
 	esac
 }
 
-pretty_reason() { # "ISP down 2x" -> "ISP failed 2 probes"
+pretty_reason() {
 	echo "$1" | sed -e 's/ISP down \([0-9]*\)x/ISP failed \1 probes/' \
 	               -e 's/ISP recovered \([0-9]*\)x/ISP answered \1 probes/'
 }
@@ -169,7 +265,7 @@ compose() { # compose <state> <reason> [previous_since]
 	printf '\n%s UTC\n' "$clock"
 }
 
-compose_hb() { # daily "still alive" line
+compose_hb() {
 	local st since ago clock pe
 	st=$(sval state); since=$(sval since)
 	[ -n "$st" ] || st=unknown
@@ -197,13 +293,12 @@ compose_hb() { # daily "still alive" line
 read_state() {
 	LAST_TS=-; LAST_ST=; SUPP=0; SENT_ST=
 	[ -r "$STATE_FILE" ] && read -r LAST_TS LAST_ST SUPP SENT_ST < "$STATE_FILE"
-	# migrate the 3-field format written before SENT_ST existed
 	if [ -z "$SENT_ST" ] && [ "${SUPP:-0}" = 0 ]; then
 		SENT_ST=$LAST_ST
 	fi
 }
 
-write_state() { # write_state <epoch> <state> <suppressed> [sent_state]
+write_state() {
 	printf '%s %s %s %s\n' "$1" "$2" "$3" "${4:-}" > "$STATE_FILE"
 }
 
@@ -226,18 +321,12 @@ may_send() { # may_send <state> -> 0 send, 1 suppressed
 	return 0
 }
 
-if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
-	case "$1" in
-	test|chatid|status) ;;
-	*) log "no Telegram token/chat in $CONF — not sending"; exit 0 ;;
-	esac
-fi
+load_conf
 
 case "$1" in
 sim|isp)
-	# wan-failover calls this the instant the route changes; give it a moment
-	# to write the fresh status file, then report. $3 is the ISO start of the
-	# state being left, so the message can say how long it lasted.
+	[ "$ENABLED" = 0 ] && exit 0
+	[ "$ON_SWITCH" = 0 ] && exit 0
 	sleep 2
 	may_send "$1" || exit 0
 	msg=$(compose "$1" "${2:-manual}" "$3")
@@ -248,9 +337,8 @@ sim|isp)
 	send_retry "$msg" && mark_sent "$1"
 	;;
 init)
-	# A watchdog restart must not leave the last alert lying: if the uplink
-	# settled somewhere other than what we last reported, say so. A real
-	# reboot has no state file (/tmp is RAM), so boots stay silent.
+	[ "$ENABLED" = 0 ] && exit 0
+	[ "$ON_SWITCH" = 0 ] && exit 0
 	read_state
 	if [ -z "$SENT_ST" ]; then
 		log "boot — no notification"
@@ -261,24 +349,26 @@ init)
 	send_retry "$(compose "$2" "${3:-watchdog restart}" "$4")" && mark_sent "$2"
 	;;
 heartbeat)
-	[ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || exit 0
+	[ "$ENABLED" = 0 ] && exit 0
+	[ "$ON_HB" = 0 ] && exit 0
 	send_retry "$(compose_hb)"
 	;;
 test)
-	# Renders the real layout for the current uplink; "test sim|isp" previews
-	# the other branch, and an optional ISO timestamp shows the duration line.
-	# Never touches the cooldown state.
-	[ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || {
-		echo "set TG_TOKEN and TG_CHAT in $CONF first" >&2; exit 1; }
 	st=${2:-$(sval state)}
 	case "$st" in sim|isp) ;; *) st=isp ;; esac
-	msg=$(compose "$st" "test message — no switch happened" "${3:-}")
+	msg=$(compose "$st" "test message — no switch happened" "")
 	printf '%s\n' "$msg"
 	printf '%s\n' "--- sending ---"
-	tg "$msg" && { log "test sent"; echo "delivered"; } || exit 1
+	if send_once "$msg"; then
+		log "test sent"
+		echo "delivered"
+	else
+		echo "FAILED (see logread -e $TAG)"
+		exit 1
+	fi
 	;;
 chatid)
-	[ -n "$TG_TOKEN" ] || { echo "set TG_TOKEN in $CONF first" >&2; exit 1; }
+	[ -n "$TG_TOKEN" ] || { echo "no Telegram token configured" >&2; exit 1; }
 	f=$(cfgfile "https://api.telegram.org/bot${TG_TOKEN}/getUpdates")
 	out=$(curl -4 -sS -m 10 --config "$f")
 	rm -f "$f"
@@ -292,16 +382,19 @@ chatid)
 	fi
 	;;
 status)
-	echo "config:   $CONF"
-	echo "token:    $([ -n "$TG_TOKEN" ] && echo present || echo MISSING)"
-	echo "chat:     ${TG_CHAT:-MISSING}"
-	echo "cooldown: ${MUTE}s"
-	[ -r "$STATE_FILE" ] && { printf 'last:     '; cat "$STATE_FILE"; }
-	echo "uplink:   $(sval state) since $(sval since)"
+	echo "config:     $([ -f /etc/config/notify ] && echo /etc/config/notify || echo "$LEGACY (legacy)")"
+	echo "enabled:    ${ENABLED:-1}"
+	echo "provider:   ${PROVIDER:-telegram}"
+	echo "telegram:   token $([ -n "$TG_TOKEN" ] && echo present || echo MISSING) · chat ${TG_CHAT:-MISSING}"
+	echo "discord:    webhook $([ -n "$DC_WEBHOOK" ] && echo present || echo MISSING)"
+	echo "events:     switch=$([ "${ON_SWITCH:-1}" = 0 ] && echo off || echo on) heartbeat=$([ "${ON_HB:-1}" = 0 ] && echo off || echo on)"
+	echo "cooldown:   ${MUTE:-300}s"
+	[ -r "$STATE_FILE" ] && { printf 'last:       '; cat "$STATE_FILE"; }
+	echo "uplink:     $(sval state) since $(sval since)"
 	[ -s "$LOG" ] && { echo "--- recent ---"; tail -5 "$LOG"; }
 	;;
 *)
-	echo "usage: $0 sim|isp <reason> [prev_since] | init <state> [reason] | heartbeat | test [sim|isp] | chatid | status" >&2
+	echo "usage: $0 sim|isp <reason> [prev] | init <state> [reason] [prev] | heartbeat | test [sim|isp] | chatid | status" >&2
 	exit 1
 	;;
 esac
