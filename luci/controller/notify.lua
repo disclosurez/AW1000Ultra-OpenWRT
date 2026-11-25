@@ -44,6 +44,18 @@ local function store_secret(path, value)
 	fs.rename(tmp, path)
 end
 
+-- Templates are plain text with {placeholders}; an empty box means "use the
+-- built-in default", which is what the script renders then.
+local function store_template(path, value)
+	value = value or ""
+	value = value:gsub("\r\n", "\n"):gsub("\r", "\n")
+	if trim(value) == "" then
+		fs.remove(path)
+		return
+	end
+	fs.writefile(path, value:gsub("%s+$", "") .. "\n")
+end
+
 local function valid_webhook(url)
 	return url:match("^https://") ~= nil
 end
@@ -105,6 +117,9 @@ function action_save()
 			end
 		end
 	end
+
+	store_template("/etc/notify.template.switch", http.formvalue("template_switch"))
+	store_template("/etc/notify.template.heartbeat", http.formvalue("template_heartbeat"))
 
 	http.redirect(disp.build_url("admin", "system", "notifications") .. "?" .. note .. "=1")
 end

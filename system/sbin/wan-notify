@@ -21,6 +21,8 @@ LEGACY=/etc/wan-notify.conf
 STATUS=/tmp/wanfailover.status
 STATE_FILE=/tmp/wan-notify.last
 LOG=/tmp/wan-notify.log
+TPL_SWITCH=/etc/notify.template.switch
+TPL_HB=/etc/notify.template.heartbeat
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -95,12 +97,6 @@ cfgfile() { # cfgfile <url> [data ...] -> path (0600, caller removes)
 	echo "$f"
 }
 
-to_md() { # the composed messages are HTML; Discord wants markdown
-	sed -e 's|<b>|**|g' -e 's|</b>|**|g' \
-	    -e 's|<i>|_|g'  -e 's|</i>|_|g' \
-	    -e 's|<code>|`|g' -e 's|</code>|`|g'
-}
-
 tg_one() { # tg_one <chat_id> <encoded html> -> 0 on HTTP 200
 	local f code resp rc
 	resp=/tmp/wan-notify.reply
@@ -109,7 +105,6 @@ tg_one() { # tg_one <chat_id> <encoded html> -> 0 on HTTP 200
 	{
 		printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_TOKEN"
 		printf 'data = "chat_id=%s"\n' "$1"
-		printf 'data = "parse_mode=HTML"\n'
 		printf 'data = "disable_web_page_preview=true"\n'
 		printf 'data = "text=%s"\n' "$2"
 	} > "$f"
@@ -168,7 +163,7 @@ discord_send() { # discord_send <markdown text> -> 0 on 200/204
 send_once() { # send_once <html text> -> 0 if every enabled provider took it
 	local rc=0
 	if have_tg; then tg "$1" || rc=1; fi
-	if have_dc; then discord_send "$(printf '%s\n' "$1" | to_md)" || rc=1; fi
+	if have_dc; then discord_send "$1" || rc=1; fi
 	if ! have_tg && ! have_dc; then
 		log "no provider configured (provider=$PROVIDER, token=$([ -n "$TG_TOKEN" ] && echo yes || echo no), webhook=$([ -n "$DC_WEBHOOK" ] && echo yes || echo no))"
 		return 2
@@ -221,71 +216,103 @@ pretty_reason() {
 	               -e 's/ISP recovered \([0-9]*\)x/ISP answered \1 probes/'
 }
 
-compose() { # compose <state> <reason> [previous_since]
-	local st=$1 why=$2 prev=$3 wip mip head note ago pe clock
-	wip=$(sval wan_ip); mip=$(sval modem_ip)
-	why=$(pretty_reason "${why:-manual}")
-	pe=$(epoch_of "$prev")
-	[ -n "$pe" ] && ago=$(dur $(( $(date +%s) - pe )))
-	clock=$(date -u +%H:%M:%S)
-	get_pub
-	case "$st" in
-	sim) head='📶 <b>Switched to mobile data</b>'
-	     [ -n "$ago" ] && note="ISP had been up $ago" ;;
-	isp) head='🔌 <b>Back on the wired uplink</b>'
-	     [ -n "$ago" ] && note="SIM held $ago" ;;
-	*)   head="<b>Uplink → $(esc "$st")</b>" ;;
-	esac
-
-	printf '%s\n' "$head"
-	if [ -n "$note" ]; then printf '%s · %s\n' "$(esc "$why")" "$note"
-	else printf '%s\n' "$(esc "$why")"; fi
-	printf '\n'
-	if [ "$st" = sim ]; then
-		if [ "$mip" != "-" ] && [ -n "$mip" ]; then
-			printf 'SIM  <code>%s</code>  modem link\n' "$(esc "$mip")"
-		else
-			printf 'SIM  <i>no address yet</i>\n'
-		fi
-		if [ -n "$PUB" ]; then
-			printf 'WAN  <code>%s</code>  public' "$(esc "$PUB")"
-			[ -n "$PUB_LOC" ] && printf ' · %s' "$(esc "$PUB_LOC")"
-			printf '\n'
-		fi
-	else
-		if [ "$wip" != "-" ] && [ -n "$wip" ]; then
-			printf 'WAN  <code>%s</code>  public' "$(esc "$wip")"
-		else
-			printf 'WAN  <i>no address</i>'
-		fi
-		[ -n "$PUB_LOC" ] && printf ' · %s' "$(esc "$PUB_LOC")"
-		printf '\n'
-		[ "$mip" != "-" ] && [ -n "$mip" ] && printf 'SIM  <i>parked</i>\n'
-	fi
-	printf '\n%s UTC\n' "$clock"
+fill() { # template on stdin, key=value pairs as arguments
+	local tpl k v
+	tpl=$(cat)
+	while [ "$#" -gt 0 ]; do
+		k=${1%%=*}
+		v=${1#*=}
+		# escape what sed would otherwise interpret in the replacement
+		v=$(printf '%s' "$v" | sed -e 's/[\\/&]/\\&/g')
+		tpl=$(printf '%s' "$tpl" | sed "s/{$k}/$v/g")
+		shift
+	done
+	printf '%s\n' "$tpl"
 }
 
-compose_hb() {
-	local st since ago clock pe
+default_switch_tpl() {
+	cat <<'TPL'
+{emoji} {headline}
+{detail}
+
+Active   {state}
+SIM      {sim_ip}
+ISP      {isp_ip}
+Public   {public_ip} {country}
+
+{date} {time} UTC
+TPL
+}
+
+default_hb_tpl() {
+	cat <<'TPL'
+✅ Router alive · {state} · up {uptime}
+ISP      {isp_ip}
+SIM      {sim_ip}
+Public   {public_ip} {country}
+
+{date} {time} UTC
+TPL
+}
+
+template_of() { # template_of <path> <default-fn>
+	local t
+	t=$(cat "$1" 2>/dev/null)
+	[ -n "$t" ] || t=$($2)
+	printf '%s\n' "$t"
+}
+
+build_switch() { # build_switch <state> <reason> [previous_since]
+	local st=$1 why=$2 prev=$3 emoji headline label held detail pe tpl
+	pe=$(epoch_of "$prev")
+	[ -n "$pe" ] && held=$(dur $(( $(date +%s) - pe )))
+
+	case "$st" in
+	sim) emoji='📶'; headline='Switched to mobile data'; label='SIM'
+	     [ -n "$held" ] && held="ISP had been up $held" || held="" ;;
+	isp) emoji='🔌'; headline='Back on the wired uplink'; label='ISP'
+	     [ -n "$held" ] && held="SIM held $held" || held="" ;;
+	*)   emoji='•'; headline="Uplink -> $st"; label=$st ;;
+	esac
+
+	why=$(pretty_reason "${why:-manual}")
+	if [ -n "$held" ]; then detail="$why · $held"; else detail=$why; fi
+
+	wip=$(sval wan_ip); mip=$(sval modem_ip)
+	[ -n "$wip" ] || wip='-'
+	if [ -z "$mip" ]; then
+		if [ "$st" = isp ]; then mip='parked'; else mip='-'; fi
+	fi
+	get_pub
+
+	tpl=$(template_of "$TPL_SWITCH" default_switch_tpl)
+	printf '%s\n' "$tpl" | fill \
+		emoji="$emoji" headline="$headline" detail="$detail" \
+		state="$label" sim_ip="$mip" isp_ip="$wip" \
+		public_ip="${PUB:--}" country="${PUB_LOC:+($PUB_LOC)}" \
+		date="$(date -u +%Y-%m-%d)" time="$(date -u +%H:%M:%S)" \
+		hostname="$(cat /proc/sys/kernel/hostname 2>/dev/null)"
+}
+
+build_heartbeat() {
+	local st since uptime tpl
 	st=$(sval state); since=$(sval since)
 	[ -n "$st" ] || st=unknown
-	pe=$(epoch_of "$since")
-	[ -n "$pe" ] && ago=$(dur $(( $(date +%s) - pe )))
-	clock=$(date -u +%H:%M:%S)
+	uptime='-'
+	local pe; pe=$(epoch_of "$since")
+	[ -n "$pe" ] && uptime=$(dur $(( $(date +%s) - pe )))
+
+	wip=$(sval wan_ip); mip=$(sval modem_ip)
+	[ -n "$wip" ] || wip='-'; [ -n "$mip" ] || mip='-'
 	get_pub
-	printf '<b>✅ Router alive</b>\n'
-	printf 'Uplink %s' "$(echo "$st" | tr 'a-z' 'A-Z')"
-	[ -n "$ago" ] && printf ' · up %s' "$ago"
-	printf '\n\n'
-	if [ "$st" = sim ]; then
-		[ -n "$PUB" ] && printf 'WAN  <code>%s</code>  public\n' "$(esc "$PUB")"
-		printf 'SIM  <code>%s</code>  modem link\n' "$(esc "$(sval modem_ip)")"
-	else
-		printf 'WAN  <code>%s</code>  public' "$(esc "$(sval wan_ip)")"
-		[ -n "$PUB_LOC" ] && printf ' · %s' "$(esc "$PUB_LOC")"
-		printf '\n'
-	fi
-	printf '\n%s UTC\n' "$clock"
+
+	tpl=$(template_of "$TPL_HB" default_hb_tpl)
+	printf '%s\n' "$tpl" | fill \
+		state="$(echo "$st" | tr 'a-z' 'A-Z')" uptime="$uptime" \
+		sim_ip="$mip" isp_ip="$wip" \
+		public_ip="${PUB:--}" country="${PUB_LOC:+($PUB_LOC)}" \
+		date="$(date -u +%Y-%m-%d)" time="$(date -u +%H:%M:%S)" \
+		hostname="$(cat /proc/sys/kernel/hostname 2>/dev/null)"
 }
 
 # A flapping ISP can switch every 30 s; keep at most one message per MUTE
@@ -329,10 +356,10 @@ sim|isp)
 	[ "$ON_SWITCH" = 0 ] && exit 0
 	sleep 2
 	may_send "$1" || exit 0
-	msg=$(compose "$1" "${2:-manual}" "$3")
+	msg=$(build_switch "$1" "${2:-manual}" "$3")
 	if [ "${SUPP:-0}" -gt 0 ]; then
-		msg="$msg<i>+$SUPP earlier switch(es) held back by the cooldown</i>
-"
+		msg="$msg
+(+$SUPP earlier switch(es) held back by the cooldown)"
 	fi
 	send_retry "$msg" && mark_sent "$1"
 	;;
@@ -346,17 +373,17 @@ init)
 	fi
 	[ "$SENT_ST" = "$2" ] && { log "init $2 already reported — silent"; exit 0; }
 	sleep 2
-	send_retry "$(compose "$2" "${3:-watchdog restart}" "$4")" && mark_sent "$2"
+	send_retry "$(build_switch "$2" "${3:-watchdog restart}" "$4")" && mark_sent "$2"
 	;;
 heartbeat)
 	[ "$ENABLED" = 0 ] && exit 0
 	[ "$ON_HB" = 0 ] && exit 0
-	send_retry "$(compose_hb)"
+	send_retry "$(build_heartbeat)"
 	;;
 test)
 	st=${2:-$(sval state)}
 	case "$st" in sim|isp) ;; *) st=isp ;; esac
-	msg=$(compose "$st" "test message — no switch happened" "")
+	msg=$(build_switch "$st" "test message — no switch happened" "")
 	printf '%s\n' "$msg"
 	printf '%s\n' "--- sending ---"
 	if send_once "$msg"; then
@@ -366,6 +393,13 @@ test)
 		echo "FAILED (see logread -e $TAG)"
 		exit 1
 	fi
+	;;
+template)
+	case "$2" in
+	switch)    template_of "$TPL_SWITCH" default_switch_tpl ;;
+	heartbeat) template_of "$TPL_HB" default_hb_tpl ;;
+	*) echo "usage: $0 template switch|heartbeat" >&2; exit 1 ;;
+	esac
 	;;
 chatid)
 	[ -n "$TG_TOKEN" ] || { echo "no Telegram token configured" >&2; exit 1; }
@@ -389,6 +423,7 @@ status)
 	echo "discord:    webhook $([ -n "$DC_WEBHOOK" ] && echo present || echo MISSING)"
 	echo "events:     switch=$([ "${ON_SWITCH:-1}" = 0 ] && echo off || echo on) heartbeat=$([ "${ON_HB:-1}" = 0 ] && echo off || echo on)"
 	echo "cooldown:   ${MUTE:-300}s"
+	echo "templates:  switch $([ -s "$TPL_SWITCH" ] && echo custom || echo default) · heartbeat $([ -s "$TPL_HB" ] && echo custom || echo default)"
 	[ -r "$STATE_FILE" ] && { printf 'last:       '; cat "$STATE_FILE"; }
 	echo "uplink:     $(sval state) since $(sval since)"
 	[ -s "$LOG" ] && { echo "--- recent ---"; tail -5 "$LOG"; }

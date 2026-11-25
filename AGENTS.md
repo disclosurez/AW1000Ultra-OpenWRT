@@ -234,6 +234,15 @@ does not go unnoticed. Configured in **System → Notifications**.
   is still read when `/etc/config/notify` is absent, so an upgrade keeps
   working.
 
+**Templates.** Both messages are editable on the page (and stored as plain text
+in `/etc/notify.template.switch` / `/etc/notify.template.heartbeat`; an empty box
+deletes the file and falls back to the built-in default). One template feeds
+both providers, so it is plain text with `{placeholders}` — no HTML, no
+markdown: `{emoji} {headline} {detail} {state} {sim_ip} {isp_ip} {public_ip}
+{country} {uptime} {date} {time} {hostname}`. Unknown placeholders are left
+verbatim so a typo shows up in the message instead of silently vanishing.
+`wan-notify template switch|heartbeat` prints the effective template.
+
 ```bash
 /usr/sbin/wan-notify status
 /usr/sbin/wan-notify chatid     # ids that have written to the bot
@@ -1324,6 +1333,17 @@ probe-*.sh, test-*.sh                                                     ad-hoc
 ```
 
 ## Changelog
+- **2026-11-25** — **Editable message templates.** The Notifications page gained
+  a **Message templates** box for the uplink-switch and heartbeat messages,
+  stored as plain text in `/etc/notify.template.switch` and
+  `/etc/notify.template.heartbeat` (an empty box deletes the file and restores
+  the built-in default). One template feeds Telegram and Discord, so it uses
+  `{placeholders}` rather than HTML or markdown; the page lists them and
+  `wan-notify template switch|heartbeat` prints the effective one. Delivery is
+  now plain text on both providers (the HTML/`parse_mode` path is gone, the
+  markdown conversion with it), and the default switch template shows the SIM
+  as `parked` instead of a bare dash while the ISP is active.
+
 - **2026-11-25** — **System → Notifications, and Discord.** The Telegram-only
   `wan-notify` is now configurable in LuCI: **System → Notifications** edits
   `/etc/config/notify` (provider, chat id, cooldown, which events) and writes
