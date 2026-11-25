@@ -167,6 +167,20 @@ end
 </div>
 </form>
 
+<% if q("tested") then
+	local tout = fs.readfile("/tmp/notify.test.out") or ""
+	if tout ~= "" then %>
+<div class="cbi-section">
+	<h3><%:Last test%></h3>
+	<div class="cbi-section-node">
+		<div class="cbi-value-description" style="margin:0 0 8px">
+			Exactly what was sent, and what each provider answered.
+		</div>
+		<pre class="cbi-code" style="margin:0;max-height:220px;overflow:auto"><%=pcdata(tout)%></pre>
+	</div>
+</div>
+<% end end %>
+
 <div class="cbi-section">
 	<h3><%:Recent deliveries%></h3>
 	<div class="cbi-section-node">
